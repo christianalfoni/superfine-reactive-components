@@ -24,7 +24,7 @@ const fetchUser = async (userId: string): Promise<User> => {
   };
 };
 
-const fetchPosts = async (userId: string): Promise<Post[]> => {
+const fetchPosts = async (_userId: string): Promise<Post[]> => {
   await delay(2000);
   return [
     { id: 1, title: "First Post", body: "This is my first post!" },
@@ -88,9 +88,7 @@ function UserProfile(props: { userId: string }) {
       </h3>
       <div style="display: flex; flex-direction: column; gap: 12px;">
         {data.posts?.map((post) => (
-          <div
-            key={post.id}
-            style="padding: 12px; background-color: white; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);"
+          <div style="padding: 12px; background-color: white; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);"
           >
             <h4 style="margin: 0 0 8px 0; color: #4a90e2;">{post.title}</h4>
             <p style="margin: 0; color: #666; font-size: 14px;">{post.body}</p>

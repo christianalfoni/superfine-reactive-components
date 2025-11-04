@@ -244,6 +244,7 @@ export namespace JSXInternal {
     small: HTMLAttributes<HTMLElement>;
     span: HTMLAttributes<HTMLSpanElement>;
     strong: HTMLAttributes<HTMLElement>;
+    style: HTMLAttributes<HTMLStyleElement>;
     textarea: TextareaHTMLAttributes<HTMLTextAreaElement>;
     ul: HTMLAttributes<HTMLUListElement>;
 

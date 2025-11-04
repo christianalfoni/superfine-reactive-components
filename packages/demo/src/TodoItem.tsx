@@ -9,25 +9,17 @@ interface TodoItemProps {
 }
 
 export function TodoItem(props: TodoItemProps) {
-  // Local state for hover effect
-  const state = createState({
-    isHovered: false,
-  });
-
   return () => (
     <li
-      style={`
+      style="
         display: flex;
         align-items: center;
         padding: 12px;
         margin-bottom: 8px;
-        background-color: ${state.isHovered ? "#f5f5f5" : "white"};
+        background-color: white;
         border: 1px solid #ddd;
         border-radius: 4px;
-        transition: background-color 0.2s;
-      `}
-      onMouseEnter={() => (state.isHovered = true)}
-      onMouseLeave={() => (state.isHovered = false)}
+      "
     >
       <input
         type="checkbox"
@@ -47,7 +39,7 @@ export function TodoItem(props: TodoItemProps) {
       </span>
       <button
         onClick={() => props.onDelete(props.id)}
-        style={`
+        style="
           padding: 6px 12px;
           background-color: #f44336;
           color: white;
@@ -55,9 +47,7 @@ export function TodoItem(props: TodoItemProps) {
           border-radius: 4px;
           cursor: pointer;
           font-size: 14px;
-          opacity: ${state.isHovered ? 1 : 0.5};
-          transition: opacity 0.2s;
-        `}
+        "
       >
         Delete
       </button>

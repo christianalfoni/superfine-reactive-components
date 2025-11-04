@@ -1,11 +1,14 @@
 /**
- * Component System
+ * Component System - Host-Based Architecture
  *
- * This module implements the component lifecycle for Superfine Components.
+ * This module implements a host-based component system where each component:
+ * 1. Creates a host DOM element (<component> tag with display: contents)
+ * 2. Patches its own virtual DOM directly to this host using Superfine
+ * 3. Stores the component instance on the host node as a property
+ * 4. Operates independently of other components for rendering
+ * 5. Tracks direct children for efficient cleanup detection
  *
  * ## Component Lifecycle Phases
- *
- * Components go through three distinct phases:
  *
  * ### 1. Setup Phase (runs once per component instance)
  * When a component function is first called:
@@ -21,52 +24,16 @@
  * - Render function executes: `return () => <div>...</div>`
  * - Accesses reactive state to determine what to render
  * - Returns JSX describing the UI
- * - Tracking: `currentRenderingComponent` is set during this phase
- *
- * ### 3. JSX Processing Phase (happens during render)
- * After render function returns JSX:
- * - JSX is converted to virtual DOM nodes
- * - Child components are created (their setup phase runs here)
- * - Child components need to know their parent for context traversal
- * - Tracking: `currentRenderingComponent` stays set so children can find parent
- *
- * ## Component Identity and Tree Structure
- *
- * Each component instance is identified by:
- * - `id`: Unique Symbol generated once per instance
- * - `componentFn`: The component function
- * - `parent`: Reference to parent component instance (null for root)
- * - `positionInParent`: Position among siblings with same componentFn
- * - `contextInParent`: Which context in parent ("default", "children", "fallback")
- * - `explicitKey`: Optional explicit key from props
- *
- * Children are tracked directly in parent instances:
- * - `childrenByContext`: Map<string, ComponentInstance[]>
- * - `activeChildContext`: Which context is currently being populated during render
- *
- * This tree-based approach replaces the old hierarchical string key system,
- * making component identity and relationships more explicit and type-safe.
- *
- * ## Parent-Child Relationships
- *
- * Parent relationships are crucial for context to work:
- * - When a child component is created, its parent is `currentRenderingComponent`
- * - Context walks up the parent chain to find providers
- * - Children are registered in parent's `childrenByContext` map
- *
- * ## Key Implementation Detail
- *
- * The timing of when we restore `currentRenderingComponent` is critical:
- * - ❌ WRONG: Restore immediately after `render()` returns
- * - ✅ CORRECT: Restore after `jsxToVNode()` processes all children
- *
- * This ensures child components created during JSX processing can find their parent.
+ * - JSX is converted to vnodes
+ * - Component patches its own host element independently
+ * - After patching, checks children for disconnected components
+ * - Cleans up any children that were removed from the DOM
  */
 
 import { h, patch, text, type VNode } from 'superfine';
 import { observer, createProps, updateProps, createLifecycleContext, clearLifecycleContext } from './state';
 import { FragmentSymbol } from './jsx-runtime';
-import { setContextValue, getContextValue, setGetCurrentComponent, type Context } from './context';
+import { setGetCurrentComponent } from './context';
 
 export type ComponentFunction<P extends object = {}> = (props?: P) => RenderFunction;
 export type RenderFunction = () => any;
@@ -80,59 +47,86 @@ export interface SuspenseBoundary {
 }
 
 /**
- * Component instance - represents a single instance of a component in the tree
- * Identity is based on: parent + position + context + componentFn + explicitKey
+ * Component instance - now represents a component with its host element
+ * Identity is managed by the host element's position in the DOM tree
  */
 export interface ComponentInstance<P extends object = {}> {
   // Identity
   id: symbol; // Unique identifier generated once per instance
   componentFn: ComponentFunction<P>;
-  explicitKey?: any; // Optional explicit key from props
+  explicitKey?: any; // Explicit key passed from parent (for Superfine reconciliation)
 
-  // Tree position
-  parent: ComponentInstance<any> | null; // Parent component (null for root)
-  positionInParent: number; // Position among siblings with same componentFn
-  contextInParent: string; // Which context in parent ("default", "children", "fallback", etc.)
+  // Host element
+  hostElement: HTMLElement; // The <component> DOM element
 
   // Rendering
   render: RenderFunction;
-  vnode: VNode | null;
   props: P | null;
+  cachedVNode?: VNode; // Cached vnode for optimization (Superfine skips if oldVNode === newVNode)
+
+  // Component tree tracking (for efficient cleanup checking)
+  parent: ComponentInstance<any> | null; // Parent component (for context lookup)
+  children: Map<string, ComponentInstance<any>>; // Direct child components keyed by "position:fnId:key"
+  childPosition: number; // Current child position during rendering (resets each render)
 
   // Lifecycle
   dispose?: () => void;
   cleanupCallbacks: (() => void)[];
   mountCallbacks: (() => void)[];
   hasMounted: boolean;
-  isActive: boolean; // Marked true during render, used for cleanup
 
   // Context providers (for context API)
   contexts?: Map<symbol, any[]>;
 
-  // Children tracking
-  childrenByContext: Map<string, ComponentInstance<any>[]>;
-  activeChildContext: string; // Which context is currently being populated during render
-
   // Suspense boundary (present if this is a Suspense component)
   suspenseBoundary?: SuspenseBoundary;
+
+  // Skip cleanup checks (for Suspense components that manage their own children)
+  skipCleanupCheck?: boolean;
+
+  // Context switching for Suspense (tracks which child context is active)
+  activeChildContext?: string;
 }
 
-// Track root component instances (components with no parent)
-let rootInstances: ComponentInstance<any>[] = [];
-
 // Track the currently executing component during setup phase
-// When a component function executes (setup phase), this is set to that component instance
-// Used by context system to know which component is calling context.set/get
 let currentSetupComponent: ComponentInstance<any> | null = null;
 
-// Track the currently rendering component (whose render function is executing)
-// When a render function executes and returns JSX, this is set to that component instance
-// This is the parent for any child components created during JSX processing
+// Track the currently rendering component (used for setting parent relationship)
 let currentRenderingComponent: ComponentInstance<any> | null = null;
 
-// Track the current child context name being populated
-// This determines which childrenByContext array to use
-let currentChildContext: string = "default";
+// Global counter for component function IDs (survives across all renders)
+let componentFnIdCounter = 0;
+
+// Track CSS injection state
+let cssInjected = false;
+
+// Map to track component instances by their host DOM element
+// This allows reusing instances when the same component renders again
+const instancesByElement = new WeakMap<HTMLElement, ComponentInstance<any>>();
+
+
+/**
+ * Injects the CSS rules for component elements and Suspense
+ * Called once on first render
+ */
+function injectComponentCSS(): void {
+  if (cssInjected) return;
+
+  const style = document.createElement('style');
+  style.textContent = `
+    component { display: contents; }
+
+    /* Suspense: Show children when resolved, hide when pending */
+    [data-suspense-branch="children"][data-suspense-state="resolved"] { display: contents; }
+    [data-suspense-branch="children"][data-suspense-state="pending"] { display: none; }
+
+    /* Suspense: Hide fallback when resolved, show when pending */
+    [data-suspense-branch="fallback"][data-suspense-state="resolved"] { display: none; }
+    [data-suspense-branch="fallback"][data-suspense-state="pending"] { display: contents; }
+  `;
+  document.head.appendChild(style);
+  cssInjected = true;
+}
 
 /**
  * Gets the current component instance (used by context system)
@@ -142,207 +136,69 @@ export function getCurrentComponent(): ComponentInstance<any> | null {
   return currentSetupComponent;
 }
 
-// Initialize the context system with access to getCurrentComponent
+// Initialize the context system with our getCurrentComponent function
 setGetCurrentComponent(getCurrentComponent);
 
 /**
- * Resets the render tracking. Should be called at the start of each render cycle.
- *
- * Marks all components as inactive. During render, components are matched and reactivated.
- * The isActive flag serves two purposes:
- * 1. Cleanup: inactive components after render are removed
- * 2. Matching: first inactive instance of a type is the next to reuse (preserves order)
- */
-export function resetComponentRenderOrder() {
-  // Reset child context to default
-  currentChildContext = "default";
-
-  // Mark all components as inactive (recursively)
-  function markInactive(instances: ComponentInstance<any>[]) {
-    instances.forEach(instance => {
-      instance.isActive = false;
-      // Recursively mark children
-      instance.childrenByContext.forEach((children) => {
-        markInactive(children);
-      });
-    });
-  }
-
-  markInactive(rootInstances);
-}
-
-/**
- * Cleans up inactive components after a render cycle.
- * This prevents memory leaks from components that are no longer in the tree.
- *
- * Components in inactive contexts (e.g., Suspense children while showing fallback)
- * are kept alive since they're still logically part of the tree.
- */
-function cleanupInactiveComponents() {
-  function cleanupRecursive(instances: ComponentInstance<any>[]): ComponentInstance<any>[] {
-    return instances.filter(instance => {
-      if (instance.isActive) {
-        // Component is active - recursively clean up its children
-        instance.childrenByContext.forEach((children, contextName) => {
-          const cleanedChildren = cleanupRecursive(children);
-          instance.childrenByContext.set(contextName, cleanedChildren);
-        });
-        return true; // Keep this component
-      } else {
-        // Component is inactive - check if parent is active (inactive context case)
-        if (instance.parent && instance.parent.isActive) {
-          // Parent is active but this child wasn't rendered
-          // This happens with Suspense - keep it alive!
-          console.log('[Cleanup] Keeping component in inactive context:', instance.componentFn.name);
-          return true;
-        }
-
-        // Component is truly orphaned - clean it up
-        console.log('[Cleanup] Removing inactive component:', instance.componentFn.name);
-        instance.dispose?.();
-        instance.cleanupCallbacks.forEach(cb => cb());
-        return false; // Remove this component
-      }
-    });
-  }
-
-  rootInstances = cleanupRecursive(rootInstances);
-}
-
-/**
- * Finds an existing component instance in the tree by matching criteria.
- * Matching is based on: parent + componentFn + explicitKey OR position
- *
- * For positional matching, we find the first INACTIVE instance of the same type.
- * This works because:
- * 1. At render start, all instances are marked inactive
- * 2. As we encounter components during render, we reactivate them in order
- * 3. The first inactive instance of a type is the next one to reuse
- */
-function findExistingInstance<P extends object>(
-  componentFn: ComponentFunction<P>,
-  explicitKey: any | undefined,
-  parent: ComponentInstance<any> | null,
-  contextName: string
-): ComponentInstance<P> | null {
-  // Determine where to look for existing instance
-  const siblings = parent
-    ? (parent.childrenByContext.get(contextName) || [])
-    : rootInstances;
-
-  if (explicitKey !== undefined && explicitKey !== null) {
-    // Match by explicit key and component function
-    return siblings.find(
-      child => child.componentFn === componentFn && child.explicitKey === explicitKey
-    ) as ComponentInstance<P> | undefined || null;
-  } else {
-    // Match by position: find first inactive instance of this type
-    // This ensures we reuse instances in the same order they were created
-    return siblings.find(
-      child => child.componentFn === componentFn && !child.isActive
-    ) as ComponentInstance<P> | undefined || null;
-  }
-}
-
-/**
- * Creates or gets a component instance based on tree position.
+ * Creates a component instance
  * The component function is called once (setup phase) and returns a render function.
- * If props are provided, they are made reactive and updated on subsequent renders.
  */
-export function createComponentInstance<P extends object = {}>(
+function createComponentInstance<P extends object = {}>(
   componentFn: ComponentFunction<P>,
   props?: P,
   explicitKey?: any
 ): ComponentInstance<P> {
-  // Determine parent and context
-  const parent = currentRenderingComponent;
-  const contextName = parent?.activeChildContext || currentChildContext;
+  // Always create reactive props, even if empty
+  const reactiveProps = props && Object.keys(props).length > 0
+    ? createProps(props)
+    : createProps({} as P);
 
-  // Try to find existing instance
-  let instance = findExistingInstance<P>(componentFn, explicitKey, parent, contextName);
+  // Create lifecycle context to collect mount/cleanup callbacks
+  const lifecycleContext = createLifecycleContext();
 
-  // If no instance exists, or the component function changed, create a new one
-  if (!instance || instance.componentFn !== componentFn) {
-    // Dispose old instance if it exists but function changed
-    if (instance && instance.componentFn !== componentFn) {
-      instance.dispose?.();
-      instance.cleanupCallbacks.forEach(cb => cb());
-    }
+  // Create new instance (host element will be set later by Superfine)
+  const instance: ComponentInstance<P> = {
+    id: Symbol(),
+    componentFn,
+    explicitKey, // Store the key for vnode creation
+    hostElement: null as any, // Will be set when oncreate is called
+    render: null as any, // Will be set after componentFn call
+    props: reactiveProps,
+    parent: currentRenderingComponent, // Set parent to the currently rendering component
+    children: new Map(), // Initialize children tracking with Map
+    childPosition: 0, // Initialize child position counter
+    dispose: undefined,
+    cleanupCallbacks: lifecycleContext.cleanupCallbacks,
+    mountCallbacks: lifecycleContext.mountCallbacks,
+    hasMounted: false
+  };
 
-    // Always create reactive props, even if empty
-    const reactiveProps = props && Object.keys(props).length > 0
-      ? createProps(props)
-      : createProps({} as P);
+  // Set this as the current setup component
+  const previousSetupComponent = currentSetupComponent;
+  currentSetupComponent = instance;
 
-    // Create lifecycle context to collect mount/cleanup callbacks
-    const lifecycleContext = createLifecycleContext();
-
-    // Calculate position among siblings with same componentFn
-    const siblings = parent
-      ? (parent.childrenByContext.get(contextName) || [])
-      : rootInstances;
-    const sameTypeSiblings = siblings.filter(child => child.componentFn === componentFn);
-    const position = sameTypeSiblings.length;
-
-    // Create new instance
-    const newInstance: ComponentInstance<P> = {
-      id: Symbol(),
-      componentFn,
-      explicitKey,
-      parent,
-      positionInParent: position,
-      contextInParent: contextName,
-      render: null as any, // Will be set after componentFn call
-      vnode: null,
-      props: reactiveProps,
-      dispose: undefined,
-      cleanupCallbacks: lifecycleContext.cleanupCallbacks,
-      mountCallbacks: lifecycleContext.mountCallbacks,
-      hasMounted: false,
-      isActive: true,
-      childrenByContext: new Map(),
-      activeChildContext: "default"
-    };
-
-    // Set this as the current setup component
-    const previousSetupComponent = currentSetupComponent;
-    currentSetupComponent = newInstance;
-
-    try {
-      // Call the component function once to get the render function (setup phase)
-      const render = componentFn(reactiveProps);
-      newInstance.render = render;
-    } finally {
-      // Restore previous setup component context
-      currentSetupComponent = previousSetupComponent;
-      clearLifecycleContext();
-    }
-
-    instance = newInstance;
-
-    // Add to parent's children or root instances
-    // (Only happens for NEW instances)
-    if (parent) {
-      let contextChildren = parent.childrenByContext.get(contextName);
-      if (!contextChildren) {
-        contextChildren = [];
-        parent.childrenByContext.set(contextName, contextChildren);
-      }
-      contextChildren.push(instance);
-    } else {
-      rootInstances.push(instance);
-    }
-  } else {
-    // Existing instance found - mark as active and update props
-    instance.isActive = true;
-
-    if (props && Object.keys(props).length > 0 && instance.props) {
-      // Instance exists - update props to trigger reactivity
-      updateProps(instance.props, props);
-    }
+  try {
+    // Call the component function once to get the render function (setup phase)
+    const render = componentFn(reactiveProps);
+    instance.render = render;
+  } finally {
+    // Restore previous setup component context
+    currentSetupComponent = previousSetupComponent;
+    clearLifecycleContext();
   }
 
   return instance;
+}
+
+/**
+ * Gets or assigns a unique ID to a component function
+ * Used for instance caching to handle minification
+ */
+function getComponentFnId(fn: ComponentFunction): number {
+  if (!(fn as any).__componentId) {
+    (fn as any).__componentId = ++componentFnIdCounter;
+  }
+  return (fn as any).__componentId;
 }
 
 /**
@@ -353,61 +209,159 @@ export function isComponentFunction(value: any): value is ComponentFunction {
 }
 
 /**
- * Renders a component tree to vdom by calling all render functions
+ * Renders a component by creating its instance and returning the host element as a vnode
  */
 export function renderComponent(type: any, props: any): VNode {
   if (isComponentFunction(type)) {
-    // Check if this is a Fragment (special case - doesn't return a render function)
-    // Use the $$typeof symbol for reliable identification (survives minification)
+    // Check if this is a Fragment (special case - doesn't create a host element)
     if ((type as any).$$typeof === FragmentSymbol) {
       // Fragment doesn't use the component instance system
-      // Just call it directly with props and return children
       const result = type(props);
       return jsxToVNode(result);
     }
 
-    // Extract key from props if present, but keep children
+    // Extract key from props if present
     const { key, ...componentProps } = props || {};
 
-    // Create or update component instance with props (including children) and key
-    const instance = createComponentInstance(type, componentProps, key);
+    // Get component function ID
+    const fnId = getComponentFnId(type);
 
-    // Set this instance as the currently rendering component
-    // This is crucial: child components created during JSX processing need to know their parent
-    // We keep this set until AFTER jsxToVNode processes all children
-    const previousRenderingComponent = currentRenderingComponent;
-    const previousChildContext = currentChildContext;
-    currentRenderingComponent = instance;
+    // Try to reuse instance from parent's children cache
+    let instance: ComponentInstance<any> | undefined;
+    const parent = currentRenderingComponent;
 
-    try {
-      // Call the render function to get the JSX output (render phase)
-      // The render function may set instance.activeChildContext to switch contexts (e.g., Suspense)
-      const jsxOutput = instance.render();
+    if (parent) {
+      // Generate cache key: If explicit key provided, use it; otherwise use position
+      const cacheKey = key !== undefined && key !== null
+        ? `key:${fnId}:${key}`
+        : `pos:${fnId}:${parent.childPosition}`;
 
-      // If the output is another component, recursively render it
-      if (jsxOutput && typeof jsxOutput.type === 'function') {
-        const result = renderComponent(jsxOutput.type, jsxOutput.props);
-        // Restore previous rendering component and context after processing children
-        currentRenderingComponent = previousRenderingComponent;
-        currentChildContext = previousChildContext;
-        return result;
+      instance = parent.children.get(cacheKey);
+
+      if (instance) {
+        // Reuse existing instance!
+        // Update props (reactive system will trigger observer if values changed)
+        if (componentProps && Object.keys(componentProps).length > 0) {
+          updateProps(instance.props!, componentProps);
+        }
       }
 
-      // Convert the JSX output to a superfine vnode (JSX processing phase)
-      // Child components are created here, and they need currentRenderingComponent to be set
-      const vnode = jsxToVNode(jsxOutput);
-
-      // Restore previous rendering component and context after processing all children
-      currentRenderingComponent = previousRenderingComponent;
-      currentChildContext = previousChildContext;
-
-      return vnode;
-    } catch (error) {
-      // Restore on error too
-      currentRenderingComponent = previousRenderingComponent;
-      currentChildContext = previousChildContext;
-      throw error;
+      // Increment position for next child (only for non-keyed children)
+      if (key === undefined || key === null) {
+        parent.childPosition++;
+      }
     }
+
+    // Generate cache key and composite key for this child
+    // Cache key: used for instance lookup in parent's children map
+    // Composite key: used for Superfine reconciliation (includes fnId to avoid collisions)
+    let cacheKey: string;
+    let compositeKey: string | undefined;
+
+    if (parent) {
+      if (key !== undefined && key !== null) {
+        cacheKey = `key:${fnId}:${key}`;
+        compositeKey = `${fnId}:${key}`; // Include fnId to avoid collisions between different component types
+      } else {
+        // For positional children, we already incremented above, so use -1
+        cacheKey = `pos:${fnId}:${parent.childPosition - 1}`;
+        compositeKey = undefined; // No explicit key for positional children
+      }
+    } else {
+      cacheKey = `root:${fnId}`;
+      compositeKey = undefined; // Root components don't need keys
+    }
+
+    // Create new instance if not found in cache, passing the composite key
+    if (!instance) {
+      instance = createComponentInstance(type, componentProps, compositeKey);
+    }
+
+    // If reusing an existing instance, return cached vnode
+    // Superfine will see oldVNode === newVNode and skip diffing the subtree!
+    // The child's observer will handle re-rendering if props changed
+    if (instance.dispose && instance.cachedVNode) {
+      // Props were updated above - observer will run async if values changed
+      // Return cached vnode so Superfine skips this subtree
+      return instance.cachedVNode;
+    }
+
+    // New instance - wrap the render function with observer to track dependencies
+    // This will be called initially and on every re-render when state changes
+    let initialChildVNodes: any;
+
+    instance.dispose = observer(() => {
+      const hostElement = instance.hostElement;
+
+      // Reset child position for this render
+      instance.childPosition = 0;
+
+      // Set current rendering component so children know their parent
+      const previousRenderingComponent = currentRenderingComponent;
+      currentRenderingComponent = instance;
+
+      try {
+        // Call render function - this tracks state access!
+        const jsxOutput = instance.render();
+        const childVNodes = jsxToVNode(jsxOutput);
+
+        // If host element is not set yet, we're in initial render
+        if (!hostElement) {
+          // Store for initial vnode creation
+          initialChildVNodes = childVNodes;
+          return;
+        }
+
+        // Check if component was removed from DOM
+        if (!hostElement.isConnected) {
+          // Run cleanup callbacks
+          instance.cleanupCallbacks.forEach((cb: () => void) => cb());
+          // Dispose this observer (stops it from running again)
+          instance.dispose?.();
+          return;
+        }
+
+        // Re-render: patch the host element with new children
+
+        const newHostVNode = h('component', {
+          'data-name': type.name || 'Anonymous',
+          ...(instance.explicitKey !== undefined && instance.explicitKey !== null ? { key: instance.explicitKey, 'data-key': String(instance.explicitKey) } : {})
+        }, Array.isArray(childVNodes) ? childVNodes : [childVNodes]);
+
+        // NOTE: We do NOT update instance.cachedVNode here!
+        // The cached vnode is only for parent reconciliation - it should remain stable
+        // so the parent always gets the same reference back (for Superfine short-circuiting)
+
+        patch(hostElement, newHostVNode);
+
+        // Set up any new component instances that were created during this render
+        setupComponentInstances(childVNodes);
+
+        // Apply refs
+        applyRefs(childVNodes);
+
+        // Check if any children were removed from the DOM and clean them up
+        checkChildrenConnected(instance);
+      } finally {
+        // Restore previous rendering component
+        currentRenderingComponent = previousRenderingComponent;
+      }
+    });
+
+    // Create a vnode for the host element with the initial children
+    const vnode = h('component', {
+      'data-name': type.name || 'Anonymous',
+      ...(instance.explicitKey !== undefined && instance.explicitKey !== null ? { key: instance.explicitKey, 'data-key': String(instance.explicitKey) } : {})
+    }, Array.isArray(initialChildVNodes) ? initialChildVNodes : [initialChildVNodes]);
+
+    // Store the instance and cache key on the vnode so we can set it up after patching
+    (vnode as any).__instance = instance;
+    (vnode as any).__childCacheKey = cacheKey;
+
+    // Cache the vnode for future renders (Superfine optimization)
+    instance.cachedVNode = vnode;
+
+    return vnode;
   }
 
   // Not a component, create a regular vnode
@@ -461,7 +415,6 @@ function jsxToVNode(jsx: any): VNode {
       childNodes = children.map(jsxToVNode).flat();
     } else {
       const child = jsxToVNode(children);
-      // If jsxToVNode returns an array (e.g., from Fragment), flatten it
       childNodes = Array.isArray(child) ? child : [child];
     }
   }
@@ -510,102 +463,149 @@ function applyRefs(vnode: VNode | VNode[]): void {
 }
 
 /**
- * Runs mount callbacks for components that haven't been mounted yet
- * This happens after refs are applied so refs are available in onMount
+ * Recursively cleans up a component instance and all its descendants
+ * Called when a component is removed from the DOM
  */
-function runPendingMountCallbacks() {
-  function runRecursive(instances: ComponentInstance<any>[]) {
-    instances.forEach(instance => {
-      if (!instance.hasMounted && instance.isActive) {
-        instance.hasMounted = true;
-        instance.mountCallbacks.forEach(cb => cb());
-      }
-      // Recursively process children
-      instance.childrenByContext.forEach(children => {
-        runRecursive(children);
-      });
-    });
+function cleanupComponentTree(instance: ComponentInstance<any>): void {
+  // First, recursively clean up all children
+  for (const child of instance.children.values()) {
+    cleanupComponentTree(child);
   }
 
-  runRecursive(rootInstances);
+  // Clear the children map
+  instance.children.clear();
+
+  // Run this component's cleanup callbacks
+  instance.cleanupCallbacks.forEach((cb: () => void) => cb());
+
+  // Dispose the observer to stop it from running again
+  instance.dispose?.();
 }
 
 /**
- * Mounts a component to a DOM element
+ * Checks children for disconnected components after a re-render
+ * Cleans up any children that are no longer in the DOM
+ * Only checks direct children - recursion happens in cleanupComponentTree
+ */
+function checkChildrenConnected(instance: ComponentInstance<any>): void {
+  // Only check if this component has children
+  if (instance.children.size === 0) return;
+
+  const disconnectedKeys: string[] = [];
+
+  // Check each direct child's connection status
+  // We only check direct children because:
+  // - If a parent is connected, its children can only disconnect when the parent re-renders
+  // - If a parent is disconnected, cleanupComponentTree handles the entire subtree
+  for (const [cacheKey, child] of instance.children) {
+    if (!child.hostElement.isConnected) {
+      disconnectedKeys.push(cacheKey);
+    }
+  }
+
+  // Clean up disconnected children (cleanupComponentTree recurses to handle descendants)
+  for (const cacheKey of disconnectedKeys) {
+    const child = instance.children.get(cacheKey)!;
+    instance.children.delete(cacheKey);
+    cleanupComponentTree(child);
+  }
+}
+
+/**
+ * Walk the vnode tree and set up component instances
+ * This sets hostElement on instances after Superfine has created the DOM
+ * Also tracks parent-child relationships for efficient cleanup
+ */
+function setupComponentInstances(vnode: VNode | VNode[]): void {
+  if (Array.isArray(vnode)) {
+    vnode.forEach(setupComponentInstances);
+    return;
+  }
+
+  if (!vnode || typeof vnode !== 'object') return;
+
+  // Check if this vnode has a component instance
+  const instance = (vnode as any).__instance;
+  if (instance && vnode.node) {
+    const element = vnode.node as HTMLElement;
+
+    // Store the actual DOM element on the instance
+    instance.hostElement = element;
+
+    // Store the instance on the element for context/suspense traversal
+    element.__componentInstance = instance;
+
+    // Find parent component by walking up the DOM tree
+    let parentElement = element.parentElement;
+    while (parentElement) {
+      const parentInstance = (parentElement as HTMLElement).__componentInstance;
+      if (parentInstance) {
+        // Add this instance to parent's children Map using the cache key
+        const cacheKey = (vnode as any).__childCacheKey;
+        if (cacheKey) {
+          parentInstance.children.set(cacheKey, instance);
+        }
+        break;
+      }
+      parentElement = parentElement.parentElement;
+    }
+
+    // Run mount callbacks
+    if (!instance.hasMounted) {
+      instance.hasMounted = true;
+      instance.mountCallbacks.forEach((cb: () => void) => cb());
+    }
+  }
+
+  // Recursively process children
+  if (vnode.children && Array.isArray(vnode.children)) {
+    vnode.children.forEach(setupComponentInstances);
+  }
+}
+
+/**
+ * New render() API - mounts a component JSX to a DOM container
+ * This replaces the old mount(componentFn, container) API
+ */
+export function render(jsx: any, container: HTMLElement): () => void {
+  // Inject CSS on first render
+  injectComponentCSS();
+
+  // Convert JSX to vnode
+  const vnode = jsxToVNode(jsx);
+
+  // Create initial placeholder
+  let rootNode: Node = document.createTextNode('');
+  container.appendChild(rootNode);
+
+  // Patch the container
+  rootNode = patch(rootNode, vnode);
+
+  // After patching, Superfine has set vnode.node to the actual DOM elements
+  // Walk the tree and set up component instances
+  setupComponentInstances(vnode);
+
+  // Apply refs
+  applyRefs(vnode);
+
+  // Return cleanup function
+  return () => {
+    // Note: The observer will continue watching the container
+    // Could optionally disconnect it here, but would need to track the observer instance
+  };
+}
+
+/**
+ * Legacy mount() API - kept for backwards compatibility
+ * Creates a component element and renders it
  */
 export function mount(
   componentFn: ComponentFunction,
   container: HTMLElement
 ): () => void {
-  // Create an initial placeholder node in the container
-  // This ensures patch always has a node with parentNode
-  let rootNode: Node = document.createTextNode('');
-  container.appendChild(rootNode);
+  // Create JSX for the component
+  const jsx = { type: componentFn, props: {} };
 
-  // Track render depth to detect infinite loops
-  let renderDepth = 0;
-  const MAX_RENDER_DEPTH = 100;
-
-  function render() {
-    renderDepth++;
-
-    if (renderDepth > MAX_RENDER_DEPTH) {
-      renderDepth = 0;
-      throw new Error(
-        'Maximum render depth exceeded. Possible infinite render loop detected. ' +
-        'This usually happens when state is modified during render. ' +
-        'Make sure state updates only happen in event handlers, not during render.'
-      );
-    }
-
-    try {
-      // Reset component render tracking at the start of each render cycle
-      resetComponentRenderOrder();
-
-      // Set current rendering context to null (root level)
-      const previousRenderingComponent = currentRenderingComponent;
-      const previousChildContext = currentChildContext;
-      currentRenderingComponent = null;
-      currentChildContext = "default";
-
-      try {
-        // Create root component instance (has no parent)
-        const instance = createComponentInstance(componentFn, undefined, undefined);
-
-        // Render the root component
-        currentRenderingComponent = instance;
-        const jsxOutput = instance.render();
-        const newVNode = jsxToVNode(jsxOutput);
-
-        // Patch and update rootNode reference
-        // Superfine's patch expects node to already be in DOM with parentNode
-        rootNode = patch(rootNode, newVNode);
-
-        // Apply refs after patching (assigns DOM nodes to ref.current)
-        applyRefs(newVNode);
-
-        // Run mount callbacks for newly created components (after refs are set)
-        runPendingMountCallbacks();
-
-        // Clean up components that are no longer in the tree
-        cleanupInactiveComponents();
-      } finally {
-        // Restore context
-        currentRenderingComponent = previousRenderingComponent;
-        currentChildContext = previousChildContext;
-      }
-    } finally {
-      // Reset render depth after successful render
-      // Use setTimeout to reset on next tick, allowing batched updates
-      setTimeout(() => {
-        renderDepth = 0;
-      }, 0);
-    }
-  }
-
-  // Wrap render in an observer so it automatically re-renders when state changes
-  const dispose = observer(render);
-
-  // Return a cleanup function that disposes the observer
-  return dispose;
+  // Use the new render API
+  return render(jsx, container);
 }

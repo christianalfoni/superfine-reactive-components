@@ -144,7 +144,7 @@ export function setContextValue(
 
 /**
  * Internal function called by component.ts to implement context.get()
- * This needs access to currentComponent which is tracked in component.ts
+ * Walks up the component parent chain looking for components that provide the context
  */
 export function getContextValue<T extends Record<string, any>>(
   context: Context<T>,
@@ -154,15 +154,17 @@ export function getContextValue<T extends Record<string, any>>(
     throw new Error('context.get() must be called during component setup');
   }
 
-  // Walk up the component tree to find the context provider
-  let instance: ComponentInstance | undefined = currentComponent;
+  // Walk up the parent chain starting from the current component's parent
+  let instance = currentComponent.parent;
 
   while (instance) {
+    // Check if this instance provides the context
     const values = instance.contexts?.get(context._id);
     if (values) {
       // Found the context - return getter object
       return createGetterObject<T>(values);
     }
+    // Move up to parent component
     instance = instance.parent;
   }
 

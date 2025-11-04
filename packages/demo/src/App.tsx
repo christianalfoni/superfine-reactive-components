@@ -9,6 +9,22 @@ interface Todo {
   completed: boolean;
 }
 
+function Nested(props) {
+  return () => <div>{props.children}</div>;
+}
+
+export function App2() {
+  const state = createState({ showFirst: true });
+
+  return () => (
+    <div>
+      <h1 onClick={() => (state.showFirst = !state.showFirst)}>Hello There</h1>
+      {state.showFirst ? <Nested>foo</Nested> : null}
+      <Nested>Bar</Nested>
+    </div>
+  );
+}
+
 export function App() {
   // This is the setup phase - runs once
   const state = createState({
@@ -119,84 +135,84 @@ export function App() {
             {/* Input for new todo */}
             <div style="padding: 16px; border-bottom: 1px solid #eee;">
               <input
-              ref={inputRef}
-              type="text"
-              placeholder="What needs to be done?"
-              value={state.newTodoText}
-              onInput={(e: any) => (state.newTodoText = e.target.value)}
-              onKeyPress={(e: any) => {
-                if (e.key === "Enter") addTodo();
-              }}
-              style="width: 100%; padding: 12px 16px; font-size: 24px; border: none; outline: none; box-sizing: border-box;"
-            />
-          </div>
+                ref={inputRef}
+                type="text"
+                placeholder="What needs to be done?"
+                value={state.newTodoText}
+                onInput={(e: any) => (state.newTodoText = e.target.value)}
+                onKeyPress={(e: any) => {
+                  if (e.key === "Enter") addTodo();
+                }}
+                style="width: 100%; padding: 12px 16px; font-size: 24px; border: none; outline: none; box-sizing: border-box;"
+              />
+            </div>
 
-          {/* Todo list */}
-          {state.todos.length > 0 && (
-            <>
-              <ul style="list-style: none; padding: 0; margin: 0;">
-                {filteredTodos.map((todo) => (
-                  <TodoItem
-                    key={todo.id}
-                    id={todo.id}
-                    text={todo.text}
-                    completed={todo.completed}
-                    onToggle={toggleTodo}
-                    onDelete={deleteTodo}
-                  />
-                ))}
-              </ul>
+            {/* Todo list */}
+            {state.todos.length > 0 && (
+              <>
+                <ul style="list-style: none; padding: 0; margin: 0;">
+                  {filteredTodos.map((todo) => (
+                    <TodoItem
+                      key={todo.id}
+                      id={todo.id}
+                      text={todo.text}
+                      completed={todo.completed}
+                      onToggle={toggleTodo}
+                      onDelete={deleteTodo}
+                    />
+                  ))}
+                </ul>
 
-              {/* Footer */}
-              <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-top: 1px solid #eee; font-size: 14px; color: #777;">
-                <span>
-                  {activeCount} {activeCount === 1 ? "item" : "items"} left
-                </span>
+                {/* Footer */}
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-top: 1px solid #eee; font-size: 14px; color: #777;">
+                  <span>
+                    {activeCount} {activeCount === 1 ? "item" : "items"} left
+                  </span>
 
-                <div style="display: flex; gap: 8px;">
-                  <button
-                    onClick={() => (state.filter = "all")}
-                    style={
-                      state.filter === "all"
-                        ? "padding: 4px 8px; border: 1px solid #ddd; border-radius: 3px; background-color: transparent; cursor: pointer; color: #333;"
-                        : "padding: 4px 8px; border: none; border-radius: 3px; background-color: transparent; cursor: pointer; color: #777;"
-                    }
-                  >
-                    All
-                  </button>
-                  <button
-                    onClick={() => (state.filter = "active")}
-                    style={
-                      state.filter === "active"
-                        ? "padding: 4px 8px; border: 1px solid #ddd; border-radius: 3px; background-color: transparent; cursor: pointer; color: #333;"
-                        : "padding: 4px 8px; border: none; border-radius: 3px; background-color: transparent; cursor: pointer; color: #777;"
-                    }
-                  >
-                    Active
-                  </button>
-                  <button
-                    onClick={() => (state.filter = "completed")}
-                    style={
-                      state.filter === "completed"
-                        ? "padding: 4px 8px; border: 1px solid #ddd; border-radius: 3px; background-color: transparent; cursor: pointer; color: #333;"
-                        : "padding: 4px 8px; border: none; border-radius: 3px; background-color: transparent; cursor: pointer; color: #777;"
-                    }
-                  >
-                    Completed
-                  </button>
+                  <div style="display: flex; gap: 8px;">
+                    <button
+                      onClick={() => (state.filter = "all")}
+                      style={
+                        state.filter === "all"
+                          ? "padding: 4px 8px; border: 1px solid #ddd; border-radius: 3px; background-color: transparent; cursor: pointer; color: #333;"
+                          : "padding: 4px 8px; border: none; border-radius: 3px; background-color: transparent; cursor: pointer; color: #777;"
+                      }
+                    >
+                      All
+                    </button>
+                    <button
+                      onClick={() => (state.filter = "active")}
+                      style={
+                        state.filter === "active"
+                          ? "padding: 4px 8px; border: 1px solid #ddd; border-radius: 3px; background-color: transparent; cursor: pointer; color: #333;"
+                          : "padding: 4px 8px; border: none; border-radius: 3px; background-color: transparent; cursor: pointer; color: #777;"
+                      }
+                    >
+                      Active
+                    </button>
+                    <button
+                      onClick={() => (state.filter = "completed")}
+                      style={
+                        state.filter === "completed"
+                          ? "padding: 4px 8px; border: 1px solid #ddd; border-radius: 3px; background-color: transparent; cursor: pointer; color: #333;"
+                          : "padding: 4px 8px; border: none; border-radius: 3px; background-color: transparent; cursor: pointer; color: #777;"
+                      }
+                    >
+                      Completed
+                    </button>
+                  </div>
+
+                  {completedCount > 0 && (
+                    <button
+                      onClick={clearCompleted}
+                      style="padding: 4px 8px; border: none; background-color: transparent; cursor: pointer; color: #777; text-decoration: underline;"
+                    >
+                      Clear completed
+                    </button>
+                  )}
                 </div>
-
-                {completedCount > 0 && (
-                  <button
-                    onClick={clearCompleted}
-                    style="padding: 4px 8px; border: none; background-color: transparent; cursor: pointer; color: #777; text-decoration: underline;"
-                  >
-                    Clear completed
-                  </button>
-                )}
-              </div>
-            </>
-          )}
+              </>
+            )}
           </div>
         )}
 

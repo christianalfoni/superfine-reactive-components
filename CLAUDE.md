@@ -117,6 +117,102 @@ function Child(props) {
 }
 ```
 
+### 4. Component Keys and Instance Caching
+
+Components use React-style `key` props for stable identity when rendering lists:
+
+```tsx
+function TodoList() {
+  const state = createState({
+    todos: [
+      { id: 1, text: "Learn keys" },
+      { id: 2, text: "Build app" }
+    ]
+  });
+
+  return () => (
+    <ul>
+      {state.todos.map(todo => (
+        <TodoItem key={todo.id} id={todo.id} text={todo.text} />
+      ))}
+    </ul>
+  );
+}
+```
+
+**How it works:**
+
+- **Instance Caching**: Each parent component caches child instances by key (or position if no key)
+- **Cache Key Format**:
+  - With explicit key: `key:${componentFnId}:${key}` (e.g., `key:2:1`)
+  - Without key: `pos:${componentFnId}:${position}` (e.g., `pos:2:0`)
+- **Composite Keys**: For Superfine reconciliation, keys include component function ID to prevent collisions (e.g., `2:1` instead of just `1`)
+
+**Benefits:**
+- Component instances persist across parent re-renders
+- State is preserved when list order changes
+- Efficient updates - only changed components re-render
+
+### 5. VNode Caching and Superfine Short-Circuiting
+
+The framework optimizes rendering by caching vnodes at component boundaries:
+
+```tsx
+// When parent re-renders and child props haven't changed:
+if (instance.dispose && instance.cachedVNode) {
+  // Return cached vnode - Superfine sees oldVNode === newVNode
+  // and skips diffing the entire child subtree!
+  return instance.cachedVNode;
+}
+```
+
+**How it works:**
+
+1. **Component Setup**: When a component first renders, it creates a vnode for its host element
+2. **Vnode Caching**: The vnode is cached on the component instance **once during initial render**
+3. **Parent Re-render**: When parent re-renders, it calls `renderComponent()` for each child
+4. **Instance Reuse**: If child instance exists in cache, props are updated (triggers observer if changed)
+5. **Cached Vnode Return**: The **same cached vnode** is returned to parent
+6. **Superfine Optimization**: Superfine checks `if (oldVNode === newVNode)` and skips the subtree!
+7. **Async Observer**: If props/state changed, child's observer runs in microtask and patches its host element directly
+
+**Critical Detail - Cached VNode Stability:**
+
+The cached vnode is **never updated** after initial creation. When a component re-renders itself (via its internal observer), it creates a new vnode for patching but does NOT update `instance.cachedVNode`. This stability is essential:
+
+- The parent always receives the **same vnode reference**
+- Superfine's identity check (`oldVNode === newVNode`) works correctly
+- Prevents DOM duplication bugs where Superfine might reuse old DOM nodes from a mutated cached vnode
+
+**Benefits:**
+- Parent re-renders don't trigger synchronous child re-renders
+- Massive performance improvement for large component trees
+- Child components update themselves asynchronously when their props/state change
+- Leverages Superfine's built-in optimization (`oldVNode === newVNode`)
+- Stable vnode references prevent reconciliation bugs
+
+**Visual Flow:**
+```
+Parent renders
+  ├─> renderComponent(Child1)
+  │     ├─> Find cached instance ✓
+  │     ├─> Update props (schedules observer in microtask)
+  │     └─> Return cached vnode → Superfine skips Child1 subtree
+  │
+  ├─> renderComponent(Child2)
+  │     ├─> Find cached instance ✓
+  │     ├─> Update props (schedules observer in microtask)
+  │     └─> Return cached vnode → Superfine skips Child2 subtree
+  │
+  └─> Parent patch completes
+        │
+        └─> Microtask queue runs:
+              ├─> Child1 observer patches its host element (with NEW vnode)
+              │   └─> Does NOT update instance.cachedVNode
+              └─> Child2 observer patches its host element (with NEW vnode)
+                  └─> Does NOT update instance.cachedVNode
+```
+
 ## API Reference
 
 ### `createState<T>(initialState: T): T`
@@ -236,6 +332,79 @@ function MyComponent() {
   return () => <div>Timer running...</div>;
 }
 ```
+
+### `createSuspense<T>(promises: T): T`
+
+Creates suspense state for async data fetching with declarative loading states. Must be called during component setup phase inside a `<Suspense>` boundary.
+
+```tsx
+function UserProfile(props: { userId: string }) {
+  const data = createSuspense({
+    user: fetchUser(props.userId),
+    posts: fetchPosts(props.userId)
+  });
+
+  return () => (
+    <div>
+      <h1>{data.user?.name}</h1>
+      <p>{data.posts?.length} posts</p>
+    </div>
+  );
+}
+
+function App() {
+  return () => (
+    <Suspense fallback={<div>Loading...</div>}>
+      <UserProfile userId="123" />
+    </Suspense>
+  );
+}
+```
+
+**How it works:**
+- Returns a reactive state object with resolved values (initially `undefined`)
+- Automatically notifies the nearest `<Suspense>` boundary of pending promises
+- Triggers re-render when promises resolve
+- Marks the component as "suspending" to preserve its state during loading
+
+**Key behavior:**
+- Components calling `createSuspense` are kept alive even when temporarily unmounted
+- When Suspense switches between `children` and `fallback`, suspended component instances are preserved
+- Component state persists across loading transitions
+- Cleanup only happens when the Suspense boundary itself is unmounted or when all promises resolve
+
+### `<Suspense>`
+
+Component for showing fallback content while async operations are pending.
+
+```tsx
+<Suspense fallback={<Loading />}>
+  <AsyncContent />
+</Suspense>
+```
+
+**Props:**
+- `fallback` - Content to show while promises are pending
+- `children` - Content to show when no promises are pending
+
+**Important behaviors:**
+1. **Instance preservation**: Children that call `createSuspense` maintain their component instances when switching between loading and content states
+2. **Nested boundaries**: Suspense boundaries can be nested, with each boundary handling its own loading state
+3. **Conditional rendering**: Children can be conditionally rendered - suspended components stay alive even when not in the tree
+
+**Example with conditional rendering:**
+```tsx
+function App() {
+  const state = createState({ showProfile: true });
+
+  return () => (
+    <Suspense fallback={<Loading />}>
+      {state.showProfile ? <UserProfile /> : null}
+    </Suspense>
+  );
+}
+```
+When `showProfile` toggles, the UserProfile component instance is preserved (if it called `createSuspense`), maintaining its state and avoiding refetching data.
 
 ## Architecture
 

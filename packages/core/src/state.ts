@@ -42,14 +42,27 @@ function scheduleNotification(listener: Listener) {
   if (!isNotificationScheduled) {
     isNotificationScheduled = true;
     queueMicrotask(() => {
-      // Copy the set before clearing to handle any new notifications triggered during execution
-      const listeners = Array.from(pendingNotifications);
-      pendingNotifications.clear();
-      isNotificationScheduled = false;
-
-      // Notify all listeners
-      listeners.forEach(listener => listener());
+      flushObservers();
     });
+  }
+}
+
+/**
+ * Flushes all pending observer notifications
+ * Allows nested observer execution - new notifications triggered during flush
+ * are processed in the next microtask batch
+ */
+function flushObservers() {
+  isNotificationScheduled = false;
+
+  // Copy the set before clearing to process this batch
+  const listeners = Array.from(pendingNotifications);
+  pendingNotifications.clear();
+
+  // Run each listener - they may trigger new state changes which will
+  // schedule new microtasks, but won't be processed in this batch
+  for (const listener of listeners) {
+    listener();
   }
 }
 

@@ -1,4 +1,8 @@
-import { createState, createSuspense, Suspense } from "@superfine-components/core";
+import {
+  createState,
+  createSuspense,
+  Suspense,
+} from "@superfine-components/core";
 
 // Mock API functions that simulate network delay
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -41,12 +45,8 @@ const fetchStats = async (): Promise<{ views: number; likes: number }> => {
 // Loading component shown while data is fetching
 function Loading() {
   return () => (
-    <div
-      style="padding: 40px; text-align: center; color: #999; font-style: italic;"
-    >
-      <div
-        style="display: inline-block; width: 40px; height: 40px; border: 4px solid #f3f3f3; border-top: 4px solid #4a90e2; border-radius: 50%; animation: spin 1s linear infinite;"
-      />
+    <div style="padding: 40px; text-align: center; color: #999; font-style: italic;">
+      <div style="display: inline-block; width: 40px; height: 40px; border: 4px solid #f3f3f3; border-top: 4px solid #4a90e2; border-radius: 50%; animation: spin 1s linear infinite;" />
       <p style="margin-top: 16px;">Loading...</p>
       <style>
         {`@keyframes spin {
@@ -60,7 +60,9 @@ function Loading() {
 
 // User profile component that suspends while fetching data
 function UserProfile(props: { userId: string }) {
-  console.log('[UserProfile] SETUP PHASE - this should only run once per instance!');
+  console.log(
+    "[UserProfile] SETUP PHASE - this should only run once per instance!"
+  );
 
   // createSuspense is called during setup phase (runs once)
   // It returns reactive state with resolved values (initially undefined)
@@ -88,8 +90,7 @@ function UserProfile(props: { userId: string }) {
       </h3>
       <div style="display: flex; flex-direction: column; gap: 12px;">
         {data.posts?.map((post) => (
-          <div style="padding: 12px; background-color: white; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);"
-          >
+          <div style="padding: 12px; background-color: white; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
             <h4 style="margin: 0 0 8px 0; color: #4a90e2;">{post.title}</h4>
             <p style="margin: 0; color: #666; font-size: 14px;">{post.body}</p>
           </div>
@@ -101,29 +102,34 @@ function UserProfile(props: { userId: string }) {
 
 // Stats component that suspends independently
 function Stats() {
+  console.log('[Stats] SETUP PHASE - this should only run once per instance!');
+
   const data = createSuspense({
     stats: fetchStats(),
   });
 
-  return () => (
-    <div style="padding: 20px; background-color: #e8f4f8; border-radius: 8px;">
-      <h2 style="margin-top: 0; color: #333;">Statistics</h2>
-      <div style="display: flex; gap: 24px;">
-        <div>
-          <p style="margin: 0; font-size: 14px; color: #777;">Views</p>
-          <p style="margin: 4px 0 0 0; font-size: 28px; font-weight: bold; color: #4a90e2;">
-            {data.stats?.views.toLocaleString()}
-          </p>
-        </div>
-        <div>
-          <p style="margin: 0; font-size: 14px; color: #777;">Likes</p>
-          <p style="margin: 4px 0 0 0; font-size: 28px; font-weight: bold; color: #4a90e2;">
-            {data.stats?.likes.toLocaleString()}
-          </p>
+  return () => {
+    console.log('[Stats] RENDER - data.stats:', data.stats);
+    return (
+      <div style="padding: 20px; background-color: #e8f4f8; border-radius: 8px;">
+        <h2 style="margin-top: 0; color: #333;">Statistics</h2>
+        <div style="display: flex; gap: 24px;">
+          <div>
+            <p style="margin: 0; font-size: 14px; color: #777;">Views</p>
+            <p style="margin: 4px 0 0 0; font-size: 28px; font-weight: bold; color: #4a90e2;">
+              {data.stats?.views.toLocaleString()}
+            </p>
+          </div>
+          <div>
+            <p style="margin: 0; font-size: 14px; color: #777;">Likes</p>
+            <p style="margin: 4px 0 0 0; font-size: 28px; font-weight: bold; color: #4a90e2;">
+              {data.stats?.likes.toLocaleString()}
+            </p>
+          </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  };
 }
 
 // Main Suspense example component
@@ -166,9 +172,9 @@ export function SuspenseExample() {
 
         <div style="padding: 12px; background-color: #fff9e6; border-left: 4px solid #ffcc00; border-radius: 4px;">
           <p style="margin: 0; font-size: 14px; color: #666;">
-            <strong>💡 Tip:</strong> Click "Refresh Data" to see the loading states.
-            The profile takes 2 seconds (waits for both user and posts), while stats
-            loads independently in 1 second.
+            <strong>💡 Tip:</strong> Click "Refresh Data" to see the loading
+            states. The profile takes 2 seconds (waits for both user and posts),
+            while stats loads independently in 1 second.
           </p>
         </div>
       </div>
@@ -176,13 +182,13 @@ export function SuspenseExample() {
       {/* Nested Suspense boundaries - each handles loading independently */}
       <div style="display: grid; grid-template-columns: 1fr; gap: 20px;">
         {state.showProfile && (
-          <Suspense fallback={<Loading />}>
+          <Suspense key="profile-suspense" fallback={<Loading />}>
             {/* Key prop forces recreation when userId changes */}
             <UserProfile key={state.userId} userId={state.userId} />
           </Suspense>
         )}
 
-        <Suspense fallback={<Loading />}>
+        <Suspense key="stats-suspense" fallback={<Loading />}>
           <Stats key={state.userId} />
         </Suspense>
       </div>
@@ -194,25 +200,39 @@ export function SuspenseExample() {
         </h3>
         <ul style="margin: 8px 0; padding-left: 24px;">
           <li style="margin-bottom: 8px;">
-            <code style="background-color: #fff; padding: 2px 6px; border-radius: 3px;">createSuspense()</code>
-            {" "}is called during component setup (runs once)
+            <code style="background-color: #fff; padding: 2px 6px; border-radius: 3px;">
+              createSuspense()
+            </code>{" "}
+            is called during component setup (runs once)
           </li>
           <li style="margin-bottom: 8px;">
-            Returns reactive state with values initially <code style="background-color: #fff; padding: 2px 6px; border-radius: 3px;">undefined</code>
+            Returns reactive state with values initially{" "}
+            <code style="background-color: #fff; padding: 2px 6px; border-radius: 3px;">
+              undefined
+            </code>
           </li>
           <li style="margin-bottom: 8px;">
             Notifies nearest Suspense boundary of pending promises
           </li>
           <li style="margin-bottom: 8px;">
-            Suspense shows fallback while <code style="background-color: #fff; padding: 2px 6px; border-radius: 3px;">pendingCount {'>'} 0</code>
+            Suspense shows fallback while{" "}
+            <code style="background-color: #fff; padding: 2px 6px; border-radius: 3px;">
+              pendingCount {">"} 0
+            </code>
           </li>
           <li style="margin-bottom: 8px;">
-            When promises resolve, reactive state updates trigger automatic re-renders
+            When promises resolve, reactive state updates trigger automatic
+            re-renders
           </li>
           <li style="margin-bottom: 8px;">
             Component instances use different render contexts (
-            <code style="background-color: #fff; padding: 2px 6px; border-radius: 3px;">[children]</code> vs{" "}
-            <code style="background-color: #fff; padding: 2px 6px; border-radius: 3px;">[fallback]</code>
+            <code style="background-color: #fff; padding: 2px 6px; border-radius: 3px;">
+              [children]
+            </code>{" "}
+            vs{" "}
+            <code style="background-color: #fff; padding: 2px 6px; border-radius: 3px;">
+              [fallback]
+            </code>
             ) so they persist throughout
           </li>
           <li>

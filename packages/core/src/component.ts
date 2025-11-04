@@ -57,6 +57,14 @@ export type ComponentFunction<P extends object = {}> = (props?: P) => RenderFunc
 export type RenderFunction = () => any;
 
 /**
+ * Suspense boundary interface for tracking pending promises
+ */
+export interface SuspenseBoundary {
+  addPending: (count: number) => void;
+  removePending: (count: number) => void;
+}
+
+/**
  * Render context for tracking child component positions.
  * Each component can have multiple render contexts (e.g., Suspense has "children" and "fallback")
  */
@@ -71,7 +79,7 @@ interface RenderContext {
   parentInstance: ComponentInstance<any>;
 }
 
-interface ComponentInstance<P extends object = {}> {
+export interface ComponentInstance<P extends object = {}> {
   componentFn: ComponentFunction<P>;
   render: RenderFunction;
   vnode: VNode | null;
@@ -91,6 +99,9 @@ interface ComponentInstance<P extends object = {}> {
 
   // Currently active render context (set during rendering)
   activeContext?: RenderContext;
+
+  // Suspense boundary (present if this is a Suspense component)
+  suspenseBoundary?: SuspenseBoundary;
 }
 
 // Track component instances by their unique keys
@@ -147,6 +158,9 @@ export function resetComponentRenderOrder() {
 /**
  * Cleans up inactive components after a render cycle.
  * This prevents memory leaks from components that are no longer in the tree.
+ *
+ * Special handling for render contexts: Components in inactive contexts
+ * (e.g., Suspense children while showing fallback) are kept alive.
  */
 function cleanupInactiveComponents() {
   // Remove components that weren't rendered in this cycle
@@ -154,9 +168,33 @@ function cleanupInactiveComponents() {
 
   componentInstances.forEach((instance, key) => {
     if (!instance.isActive) {
-      // Call dispose function if it exists to clean up observers
+      // Check if this component is in an inactive render context of an active parent
+      // If so, keep it alive (Option A: Keep All Contexts Alive)
+      const parent = instance.parent;
+      if (parent && parent.isActive) {
+        // Parent is active - check if this component is in one of parent's render contexts
+        let isInParentContext = false;
+        for (const [contextId, context] of parent.renderContexts.entries()) {
+          // Check if the component key includes this context path
+          const contextPath = contextId === 'default' ? '' : `[${contextId}]`;
+          const expectedPrefix = `${parent.key}${contextPath}/`;
+          if (key.startsWith(expectedPrefix)) {
+            isInParentContext = true;
+            break;
+          }
+        }
+
+        // If component is in a parent context but not rendered this cycle,
+        // it's in an inactive context - keep it alive!
+        if (isInParentContext) {
+          console.log('[Cleanup] Keeping component in inactive context:', key);
+          return; // Skip cleanup for this component
+        }
+      }
+
+      // Component is truly orphaned - clean it up
+      console.log('[Cleanup] Removing inactive component:', key);
       instance.dispose?.();
-      // Run cleanup callbacks
       instance.cleanupCallbacks.forEach(cb => cb());
       keysToDelete.push(key);
     }
@@ -345,6 +383,7 @@ export function renderComponent(type: any, props: any): VNode {
     const instance = createComponentInstance(type, componentProps, key, currentRenderContext);
 
     // Set up default render context for this component's children
+    // (Suspense components override this by setting activeContext in their render function)
     let childContext = instance.renderContexts.get('default');
     if (!childContext) {
       childContext = {
@@ -364,12 +403,18 @@ export function renderComponent(type: any, props: any): VNode {
     const previousRenderingComponent = currentRenderingComponent;
     const previousRenderContext = currentRenderContext;
     currentRenderingComponent = instance;
-    currentRenderContext = childContext;
+
+    // Default to 'default' context, but allow component to override via activeContext
     instance.activeContext = childContext;
 
     try {
       // Call the render function to get the JSX output (render phase)
+      // The render function may set instance.activeContext to a different context (e.g., Suspense)
       const jsxOutput = instance.render();
+
+      // Use the context that the component selected (defaults to 'default', but Suspense may override)
+      const contextToUse = instance.activeContext || childContext;
+      currentRenderContext = contextToUse;
 
       // If the output is another component, recursively render it
       if (jsxOutput && typeof jsxOutput.type === 'function') {

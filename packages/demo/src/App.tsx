@@ -1,6 +1,7 @@
 import { createState, createRef, onMount } from "@superfine-components/core";
 import { TodoItem } from "./TodoItem";
 import { ContextExample } from "./ContextExample";
+import { SuspenseExample } from "./SuspenseExample";
 
 interface Todo {
   id: number;
@@ -19,7 +20,7 @@ export function App() {
     newTodoText: "",
     filter: "all" as "all" | "active" | "completed",
     nextId: 4,
-    currentTab: "todos" as "todos" | "context",
+    currentTab: "todos" as "todos" | "context" | "suspense",
   });
 
   // Create a ref to the input element
@@ -99,6 +100,16 @@ export function App() {
             }
           >
             Context Example
+          </button>
+          <button
+            onClick={() => (state.currentTab = "suspense")}
+            style={
+              state.currentTab === "suspense"
+                ? "padding: 10px 24px; font-size: 16px; border: none; border-bottom: 3px solid #4a90e2; background-color: transparent; cursor: pointer; color: #333; font-weight: 600;"
+                : "padding: 10px 24px; font-size: 16px; border: none; border-bottom: 3px solid transparent; background-color: transparent; cursor: pointer; color: #999; font-weight: 400;"
+            }
+          >
+            Suspense Demo
           </button>
         </div>
 
@@ -191,12 +202,16 @@ export function App() {
 
         {state.currentTab === "context" && <ContextExample />}
 
+        {state.currentTab === "suspense" && <SuspenseExample />}
+
         {/* Info footer */}
         <div style="margin-top: 20px; text-align: center; color: #bfbfbf; font-size: 12px;">
           <p>
             {state.currentTab === "todos"
               ? "Click to edit a todo"
-              : "Try toggling dark mode and adjusting font size"}
+              : state.currentTab === "context"
+              ? "Try toggling dark mode and adjusting font size"
+              : "Watch the loading states and component persistence"}
           </p>
           <p>
             Built with{" "}

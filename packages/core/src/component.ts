@@ -57,12 +57,18 @@ export type ComponentFunction<P extends object = {}> = (props?: P) => RenderFunc
 export type RenderFunction = () => any;
 
 /**
- * Suspense boundary interface for managing async data loading
- * Suspense components implement this to track pending promises from children
+ * Render context for tracking child component positions.
+ * Each component can have multiple render contexts (e.g., Suspense has "children" and "fallback")
  */
-export interface SuspenseBoundary {
-  addPending: (count: number) => void;
-  removePending: (count: number) => void;
+interface RenderContext {
+  // Unique identifier for this context (e.g., "default", "children", "fallback")
+  contextId: string;
+
+  // Position counter for children rendered in this context
+  childPosition: number;
+
+  // Reference to the parent component instance that owns this context
+  parentInstance: ComponentInstance<any>;
 }
 
 interface ComponentInstance<P extends object = {}> {
@@ -78,18 +84,24 @@ interface ComponentInstance<P extends object = {}> {
   key: string; // Unique key for this component instance
   parent?: ComponentInstance<any>; // Parent component in the tree
   contexts?: Map<symbol, any[]>; // Context values provided by this component
-  suspenseBoundary?: SuspenseBoundary; // Present if this component is a Suspense boundary
+
+  // Render contexts for this component's children
+  // Most components have only "default", Suspense has multiple
+  renderContexts: Map<string, RenderContext>;
+
+  // Currently active render context (set during rendering)
+  activeContext?: RenderContext;
 }
 
 // Track component instances by their unique keys
-// Keys are generated from: explicit key prop + component function + render position
+// Keys are generated from: explicit key prop + component function + hierarchical position
 let componentInstances = new Map<string, ComponentInstance<any>>();
-
-// Track the order components are rendered in (for generating positional keys)
-let componentRenderIndex = 0;
 
 // Track which keys were used in current render (for cleanup)
 let usedKeysInCurrentRender = new Set<string>();
+
+// Track root-level component position (only used for components with no parent)
+let globalRootPosition = 0;
 
 // Track the currently executing component during setup phase
 // When a component function executes (setup phase), this is set to that component instance
@@ -100,6 +112,10 @@ let currentSetupComponent: ComponentInstance<any> | null = null;
 // When a render function executes and returns JSX, this is set to that component instance
 // This is the parent for any child components created during JSX processing
 let currentRenderingComponent: ComponentInstance<any> | null = null;
+
+// Track the current render context for child component creation
+// This is the context that child components will be positioned within
+let currentRenderContext: RenderContext | null = null;
 
 /**
  * Gets the current component instance (used by context system)
@@ -113,10 +129,12 @@ export function getCurrentComponent(): ComponentInstance<any> | null {
 setGetCurrentComponent(getCurrentComponent);
 
 /**
- * Resets the component render tracking. Should be called at the start of each render cycle.
+ * Resets the render tracking. Should be called at the start of each render cycle.
+ * No longer resets a global position counter - each render context tracks its own positions.
  */
 export function resetComponentRenderOrder() {
-  componentRenderIndex = 0;
+  // Reset root position counter
+  globalRootPosition = 0;
   // Clear the set of used keys for this render cycle
   usedKeysInCurrentRender.clear();
   // Mark all components as inactive at the start of render
@@ -148,25 +166,47 @@ function cleanupInactiveComponents() {
 }
 
 /**
- * Generates a unique key for a component instance.
- * Uses explicit key prop if provided, otherwise falls back to component function name + position.
+ * Generates a unique hierarchical key for a component instance.
+ * Keys are context-aware and include the full parent path.
+ *
+ * Format examples:
+ * - Root: "App:0"
+ * - Default context: "App:0/Parent:0"
+ * - Named context: "App:0/Suspense:1[children]/UserProfile:0"
+ * - Explicit key: "App:0/List:0/Item:user-123"
  */
 function generateComponentKey<P extends object>(
   componentFn: ComponentFunction<P>,
-  explicitKey?: any
+  explicitKey: any | undefined,
+  renderContext: RenderContext | null
 ): string {
-  const position = componentRenderIndex++;
+  const fnName = componentFn.name || 'anonymous';
 
+  // Handle explicit keys
   if (explicitKey !== undefined && explicitKey !== null) {
-    // Use explicit key if provided
-    // Include component function name for additional uniqueness
-    const fnName = componentFn.name || 'anonymous';
-    return `${fnName}:${String(explicitKey)}`;
+    if (renderContext) {
+      const parentPath = renderContext.parentInstance.key;
+      const contextPath = renderContext.contextId === 'default'
+        ? ''
+        : `[${renderContext.contextId}]`;
+      return `${parentPath}${contextPath}/${fnName}:${explicitKey}`;
+    }
+    // Root level with explicit key
+    return `${fnName}:${explicitKey}`;
   }
 
-  // Fallback to position + function identity
-  // Use function name if available for better debugging
-  const fnName = componentFn.name || 'anonymous';
+  // Generate positional key within current render context
+  if (renderContext) {
+    const position = renderContext.childPosition++;
+    const parentPath = renderContext.parentInstance.key;
+    const contextPath = renderContext.contextId === 'default'
+      ? ''
+      : `[${renderContext.contextId}]`;
+    return `${parentPath}${contextPath}/${fnName}:${position}`;
+  }
+
+  // Root level component (no context)
+  const position = globalRootPosition++;
   return `${fnName}:${position}`;
 }
 
@@ -175,19 +215,22 @@ function generateComponentKey<P extends object>(
  * The component function is called once (setup phase) and returns a render function.
  * If props are provided, they are made reactive and updated on subsequent renders.
  *
- * Keys are generated from:
- * 1. Explicit key prop (if provided)
- * 2. Component function name + render position (fallback)
- *
- * This allows proper reconciliation during conditional rendering and list reordering.
+ * Keys are now hierarchical and context-aware:
+ * - Include full parent path
+ * - Position is relative to parent's render context
+ * - Multiple contexts supported (e.g., Suspense children vs fallback)
  */
 export function createComponentInstance<P extends object = {}>(
   componentFn: ComponentFunction<P>,
   props?: P,
-  explicitKey?: any
+  explicitKey?: any,
+  renderContext?: RenderContext | null
 ): ComponentInstance<P> {
+  // Use current render context if not provided
+  const contextToUse = renderContext !== undefined ? renderContext : currentRenderContext;
+
   // Generate unique key for this component
-  const key = generateComponentKey(componentFn, explicitKey);
+  const key = generateComponentKey(componentFn, explicitKey, contextToUse);
 
   // Track that this key was used in current render
   usedKeysInCurrentRender.add(key);
@@ -228,7 +271,10 @@ export function createComponentInstance<P extends object = {}>(
       isActive: true,
       key,
       // Parent is either the component being set up (during setup) or the component currently rendering
-      parent: parentToSet
+      parent: parentToSet,
+      // Initialize with empty render contexts map
+      renderContexts: new Map(),
+      activeContext: undefined
     };
 
     // Set this as the current setup component
@@ -295,13 +341,31 @@ export function renderComponent(type: any, props: any): VNode {
     const { key, ...componentProps } = props || {};
 
     // Create or update component instance with props (including children) and key
-    const instance = createComponentInstance(type, componentProps, key);
+    // Pass current render context so key generation knows the parent context
+    const instance = createComponentInstance(type, componentProps, key, currentRenderContext);
+
+    // Set up default render context for this component's children
+    let childContext = instance.renderContexts.get('default');
+    if (!childContext) {
+      childContext = {
+        contextId: 'default',
+        childPosition: 0,
+        parentInstance: instance
+      };
+      instance.renderContexts.set('default', childContext);
+    } else {
+      // Reset position counter for this render
+      childContext.childPosition = 0;
+    }
 
     // Set this instance as the currently rendering component
     // This is crucial: child components created during JSX processing need to know their parent
     // We keep this set until AFTER jsxToVNode processes all children
     const previousRenderingComponent = currentRenderingComponent;
+    const previousRenderContext = currentRenderContext;
     currentRenderingComponent = instance;
+    currentRenderContext = childContext;
+    instance.activeContext = childContext;
 
     try {
       // Call the render function to get the JSX output (render phase)
@@ -310,8 +374,9 @@ export function renderComponent(type: any, props: any): VNode {
       // If the output is another component, recursively render it
       if (jsxOutput && typeof jsxOutput.type === 'function') {
         const result = renderComponent(jsxOutput.type, jsxOutput.props);
-        // Restore previous rendering component after processing children
+        // Restore previous rendering component and context after processing children
         currentRenderingComponent = previousRenderingComponent;
+        currentRenderContext = previousRenderContext;
         return result;
       }
 
@@ -319,13 +384,15 @@ export function renderComponent(type: any, props: any): VNode {
       // Child components are created here, and they need currentRenderingComponent to be set
       const vnode = jsxToVNode(jsxOutput);
 
-      // Restore previous rendering component after processing all children
+      // Restore previous rendering component and context after processing all children
       currentRenderingComponent = previousRenderingComponent;
+      currentRenderContext = previousRenderContext;
 
       return vnode;
     } catch (error) {
       // Restore on error too
       currentRenderingComponent = previousRenderingComponent;
+      currentRenderContext = previousRenderContext;
       throw error;
     }
   }
@@ -471,26 +538,50 @@ export function mount(
     }
 
     try {
-      // Reset component render order at the start of each render cycle
-      // This ensures components are matched by their position in the tree
+      // Reset component render tracking at the start of each render cycle
       resetComponentRenderOrder();
 
-      const instance = createComponentInstance(componentFn);
-      const jsxOutput = instance.render();
-      const newVNode = jsxToVNode(jsxOutput);
+      // Create root component with no render context (null)
+      const instance = createComponentInstance(componentFn, undefined, undefined, null);
 
-      // Patch and update rootNode reference
-      // Superfine's patch expects node to already be in DOM with parentNode
-      rootNode = patch(rootNode, newVNode);
+      // Set up default render context for root component's children
+      let childContext = instance.renderContexts.get('default');
+      if (!childContext) {
+        childContext = {
+          contextId: 'default',
+          childPosition: 0,
+          parentInstance: instance
+        };
+        instance.renderContexts.set('default', childContext);
+      } else {
+        childContext.childPosition = 0;
+      }
 
-      // Apply refs after patching (assigns DOM nodes to ref.current)
-      applyRefs(newVNode);
+      // Set the root's context as current for its children
+      const previousRenderContext = currentRenderContext;
+      currentRenderContext = childContext;
+      instance.activeContext = childContext;
 
-      // Run mount callbacks for newly created components (after refs are set)
-      runPendingMountCallbacks();
+      try {
+        const jsxOutput = instance.render();
+        const newVNode = jsxToVNode(jsxOutput);
 
-      // Clean up components that are no longer in the tree
-      cleanupInactiveComponents();
+        // Patch and update rootNode reference
+        // Superfine's patch expects node to already be in DOM with parentNode
+        rootNode = patch(rootNode, newVNode);
+
+        // Apply refs after patching (assigns DOM nodes to ref.current)
+        applyRefs(newVNode);
+
+        // Run mount callbacks for newly created components (after refs are set)
+        runPendingMountCallbacks();
+
+        // Clean up components that are no longer in the tree
+        cleanupInactiveComponents();
+      } finally {
+        // Restore context
+        currentRenderContext = previousRenderContext;
+      }
     } finally {
       // Reset render depth after successful render
       // Use setTimeout to reset on next tick, allowing batched updates

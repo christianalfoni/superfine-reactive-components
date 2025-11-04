@@ -24,6 +24,16 @@ Superfine Components is an experimental framework that demonstrates how to build
 
 When making changes, **prefer simplicity and clarity over backwards compatibility**. If a cleaner implementation requires breaking changes, make them without hesitation.
 
+## Important: Testing Policy
+
+**⛔ NEVER run the dev server (`pnpm dev`) - the user will handle all testing.**
+
+When implementing features:
+1. Build the core library with `pnpm build:core`
+2. Make changes to demo files if needed
+3. DO NOT start the dev server - the user tests everything manually
+4. Only build, never run
+
 ## Core Concepts
 
 ### 1. Component Pattern

@@ -56,6 +56,15 @@ import { setContextValue, getContextValue, setGetCurrentComponent, type Context 
 export type ComponentFunction<P extends object = {}> = (props?: P) => RenderFunction;
 export type RenderFunction = () => any;
 
+/**
+ * Suspense boundary interface for managing async data loading
+ * Suspense components implement this to track pending promises from children
+ */
+export interface SuspenseBoundary {
+  addPending: (count: number) => void;
+  removePending: (count: number) => void;
+}
+
 interface ComponentInstance<P extends object = {}> {
   componentFn: ComponentFunction<P>;
   render: RenderFunction;
@@ -69,6 +78,7 @@ interface ComponentInstance<P extends object = {}> {
   key: string; // Unique key for this component instance
   parent?: ComponentInstance<any>; // Parent component in the tree
   contexts?: Map<symbol, any[]>; // Context values provided by this component
+  suspenseBoundary?: SuspenseBoundary; // Present if this component is a Suspense boundary
 }
 
 // Track component instances by their unique keys
@@ -281,10 +291,10 @@ export function renderComponent(type: any, props: any): VNode {
       return jsxToVNode(result);
     }
 
-    // Extract children and key from props if present
-    const { children, key, ...componentProps } = props || {};
+    // Extract key from props if present, but keep children
+    const { key, ...componentProps } = props || {};
 
-    // Create or update component instance with props and key
+    // Create or update component instance with props (including children) and key
     const instance = createComponentInstance(type, componentProps, key);
 
     // Set this instance as the currently rendering component

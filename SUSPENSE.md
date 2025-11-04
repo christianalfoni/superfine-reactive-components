@@ -2,18 +2,18 @@
 
 ## Goal
 
-Enable async data fetching with declarative loading states using a `Suspense` component and a `suspend()` function that works during component setup.
+Enable async data fetching with declarative loading states using a `Suspense` component and a `createSuspense()` function that works during component setup.
 
 ## Core Concept
 
 Unlike React's approach where promises are thrown during render, we use a **setup-phase suspension** pattern:
 
-1. Component setup calls `suspend()` with promises
-2. `suspend()` returns a reactive proxy with resolved values
-3. Component is marked as "suspended" if any promises are pending
-4. Render function is NOT called until all promises resolve
-5. When promises resolve, boundary is notified and triggers re-render
-6. Component is no longer suspended, render function executes with resolved values
+1. Component setup calls `createSuspense()` with promises
+2. `createSuspense()` returns a reactive state with resolved values (initially undefined)
+3. Suspense boundary is notified of pending promises
+4. Render function executes immediately (values are undefined initially)
+5. When promises resolve, reactive state updates trigger re-render
+6. Component re-renders with resolved values available
 
 ## API Design
 
@@ -21,15 +21,16 @@ Unlike React's approach where promises are thrown during render, we use a **setu
 
 ```tsx
 function UserProfile(props: { userId: string }) {
-  // Render function - only called when data is ready
-  return suspend(
-    [fetchUser(props.userId), fetchPosts(props.userId)],
-    (user, posts) => (
-      <div>
-        <h1>{user.name}</h1>
-        <p>{posts.length} posts</p>
-      </div>
-    )
+  const data = createSuspense({
+    user: fetchUser(props.userId),
+    posts: fetchPosts(props.userId)
+  });
+
+  return () => (
+    <div>
+      <h1>{data.user?.name}</h1>
+      <p>{data.posts?.length} posts</p>
+    </div>
   );
 }
 
@@ -43,7 +44,7 @@ function UserProfile(props: { userId: string }) {
 
 ```tsx
 function Dashboard() {
-  const data = suspend({
+  const data = createSuspense({
     user: fetchUser(),
     notifications: fetchNotifications(),
     stats: fetchStats(),
@@ -51,9 +52,9 @@ function Dashboard() {
 
   return () => (
     <div>
-      <h1>{data.user.name}</h1>
-      <p>Notifications: {data.notifications.length}</p>
-      <p>Stats: {data.stats.views}</p>
+      <h1>{data.user?.name}</h1>
+      <p>Notifications: {data.notifications?.length}</p>
+      <p>Stats: {data.stats?.views}</p>
     </div>
   );
 }
@@ -96,118 +97,100 @@ const promiseCache = new WeakMap<Promise<any>, PromiseCache<any>>();
 
 Promises are tracked using a WeakMap to store their resolution state. This allows the same promise to be recognized across renders.
 
-### 2. Component Suspension Tracking
+### 2. Boundary Discovery via Parent Chain
+
+Instead of a boundary stack, we use the parent chain established by the component system:
 
 ```typescript
-interface SuspendHandle {
-  isPending: boolean;
-  onResolve: (() => void) | null;
+function findNearestSuspenseBoundary(
+  component: ComponentInstance | null
+): SuspenseBoundary | null {
+  if (!component) return null;
+
+  // Walk up the parent chain looking for a Suspense boundary
+  let current = component.parent;
+
+  while (current) {
+    if (current.suspenseBoundary) {
+      return current.suspenseBoundary;
+    }
+    current = current.parent;
+  }
+
+  return null;
 }
-
-// Store suspension state per component instance
-const componentSuspension = new WeakMap<ComponentInstance, SuspendHandle>();
-
-// Track which component is currently being set up
-let currentComponentInstance: ComponentInstance | null = null;
 ```
 
-Each component instance has a suspension handle that tracks:
+This works with render contexts, which also use parent relationships.
 
-- Whether it's currently suspended (`isPending`)
-- A callback to notify the boundary when resolved (`onResolve`)
-
-### 3. The `suspend()` Function
+### 3. The `createSuspense()` Function
 
 ```typescript
-export function suspend<T extends Record<string, Promise<any>>>(
+export function createSuspense<T extends Record<string, Promise<any>>>(
   promises: T
-): { [K in keyof T]: Awaited<T[K]> } {
+): { [K in keyof T]: Awaited<T[K]> | undefined } {
+  // Must be called during setup phase
+  const currentComponent = getCurrentComponent();
+  if (!currentComponent) {
+    throw new Error('createSuspense must be called during component setup phase');
+  }
+
+  // Find nearest Suspense boundary by walking up parent chain
+  const boundary = findNearestSuspenseBoundary(currentComponent);
+  if (!boundary) {
+    throw new Error('createSuspense must be used inside a <Suspense> boundary');
+  }
+
   // Create reactive state for resolved values
   const resolvedValues = createState<any>({});
 
-  const pendingPromises: Promise<any>[] = [];
   let pendingCount = 0;
 
-  // Check each promise
+  // Process each promise
   for (const [key, promise] of Object.entries(promises)) {
     let cache = promiseCache.get(promise);
 
     if (!cache) {
       // First time seeing this promise - set up tracking
-      cache = { status: "pending" };
+      cache = { status: 'pending' };
       promiseCache.set(promise, cache);
       pendingCount++;
 
       promise.then(
         (value) => {
-          cache!.status = "resolved";
+          cache!.status = 'resolved';
           cache!.value = value;
           // Update reactive state - triggers re-render!
           resolvedValues[key] = value;
-          pendingCount--;
-
-          if (pendingCount === 0) {
-            checkAllResolved();
-          }
+          boundary.removePending(1);
         },
         (error) => {
-          cache!.status = "rejected";
+          cache!.status = 'rejected';
           cache!.error = error;
-          pendingCount--;
-          checkAllResolved();
+          boundary.removePending(1);
+          // TODO: Error boundary support
+          console.error(`Promise rejected in createSuspense (key: ${key}):`, error);
         }
       );
-    }
-
-    if (cache.status === "resolved") {
+    } else if (cache.status === 'resolved') {
+      // Already resolved - set value immediately
       resolvedValues[key] = cache.value;
-    } else if (cache.status === "rejected") {
+    } else if (cache.status === 'rejected') {
+      // Already rejected - throw error (caught by Error Boundary in future)
       throw cache.error;
-    } else if (cache.status === "pending") {
-      pendingPromises.push(promise);
+    } else if (cache.status === 'pending') {
+      // Still pending from a previous render
       pendingCount++;
     }
   }
 
-  function checkAllResolved() {
-    if (pendingCount === 0 && currentComponentInstance) {
-      const handle = componentSuspension.get(currentComponentInstance);
-      if (handle) {
-        handle.isPending = false;
-        // Notify boundary to trigger re-render
-        if (handle.onResolve) {
-          handle.onResolve();
-        }
-      }
-    }
-  }
-
-  // If any promises are pending, mark component as suspended
-  if (pendingPromises.length > 0) {
-    if (!currentComponentInstance) {
-      throw new Error("suspend() called outside component setup");
-    }
-
-    // Mark this component as suspended
-    const handle: SuspendHandle = {
-      isPending: true,
-      onResolve: null,
-    };
-    componentSuspension.set(currentComponentInstance, handle);
-
-    // Notify Suspense boundary
-    const boundary = suspenseBoundaryStack[suspenseBoundaryStack.length - 1];
-    if (!boundary) {
-      throw new Error("suspend() called outside <Suspense> boundary");
-    }
-
-    // Register callback for when all promises resolve
-    handle.onResolve = () => {
-      boundary.notifyResolved();
-    };
-
-    // Register each pending promise with boundary
-    pendingPromises.forEach((p) => boundary.notifySuspended(p));
+  // Notify boundary of pending promises
+  // Use queueMicrotask to defer notification until after component setup completes
+  // This prevents re-rendering mid-setup which would destroy the component
+  if (pendingCount > 0) {
+    queueMicrotask(() => {
+      boundary.addPending(pendingCount);
+    });
   }
 
   return resolvedValues as any;
@@ -216,228 +199,201 @@ export function suspend<T extends Record<string, Promise<any>>>(
 
 **Key behaviors:**
 
-- Returns a reactive state object that starts empty
+- Returns a reactive state object (values initially undefined)
 - Checks each promise in the cache
-- If all resolved, returns values immediately
-- If any pending, marks component as suspended
-- When all resolve, notifies boundary via `onResolve` callback
+- If resolved, sets values immediately
+- If pending, notifies boundary via `addPending()`
+- When promises resolve, updates reactive state and calls `removePending()`
+- Reactive updates automatically trigger re-render
 
 ### 4. Suspense Boundary Interface
 
 ```typescript
 // In component.ts
-let suspenseBoundaryStack: SuspenseInstance[] = [];
-
-export interface SuspenseInstance {
-  notifySuspended: (promise: Promise<any>) => void;
-  notifyResolved: () => void;
+export interface SuspenseBoundary {
+  addPending: (count: number) => void;
+  removePending: (count: number) => void;
 }
 ```
 
-The boundary stack tracks active Suspense boundaries. Child components notify the nearest boundary when they suspend or resolve.
+The boundary interface is simple - just increment/decrement pending count. No stack needed since we use parent chain walking.
 
-### 5. Component Instance Creation with Suspension Support
+### 5. Component Instance
+
+Component instances already have parent tracking:
 
 ```typescript
-// In component.ts
+interface ComponentInstance<P extends object = {}> {
+  componentFn: ComponentFunction<P>;
+  render: RenderFunction;
+  vnode: VNode | null;
+  props: P | null;
+  dispose?: () => void;
+  cleanupCallbacks: (() => void)[];
+  mountCallbacks: (() => void)[];
+  hasMounted: boolean;
+  isActive: boolean;
+  key: string;
+  parent?: ComponentInstance<any>; // Used by boundary discovery
+  contexts?: Map<symbol, any[]>;
+  suspenseBoundary?: SuspenseBoundary; // Present if this is a Suspense component
+}
+```
 
-export function createComponentInstance<P extends object = {}>(
-  componentFn: ComponentFunction<P>,
-  props?: P,
-  explicitKey?: any
-): ComponentInstance<P> {
-  const key = generateComponentKey(componentFn, explicitKey);
-  usedKeysInCurrentRender.add(key);
+The `parent` field is already set during component creation, which allows `findNearestSuspenseBoundary()` to walk up the chain.
 
-  let instance = componentInstances.get(key);
+### 6. Suspense Component with Render Contexts
 
-  if (!instance || instance.componentFn !== componentFn) {
-    if (instance && instance.componentFn !== componentFn) {
-      instance.dispose?.();
-    }
+**Current Implementation (CSS-based):**
 
-    const reactiveProps =
-      props && Object.keys(props).length > 0
-        ? createProps(props)
-        : createProps({} as P);
+```typescript
+export function Suspense(props: { fallback?: any; children: any }) {
+  const state = createState({ pendingCount: 0 });
 
-    // Create instance shell first
-    instance = {
-      componentFn,
-      render: null as any, // Will be set below
-      vnode: null,
-      props: reactiveProps,
-      dispose: undefined,
-      isActive: true,
-      key,
-    };
+  const boundary: SuspenseBoundary = {
+    addPending: (count: number) => { state.pendingCount += count; },
+    removePending: (count: number) => { state.pendingCount -= count; },
+  };
 
-    // Set as current instance so suspend() can access it
-    const prevInstance = currentComponentInstance;
-    currentComponentInstance = instance;
-
-    try {
-      // Call component setup - might call suspend()
-      const render = componentFn(reactiveProps);
-      instance.render = render;
-    } finally {
-      currentComponentInstance = prevInstance;
-    }
-
-    componentInstances.set(key, instance);
-  } else {
-    // Existing instance - update props
-    instance.isActive = true;
-    if (props && Object.keys(props).length > 0 && instance.props) {
-      updateProps(instance.props, props);
-    }
+  const currentComponent = getCurrentComponent();
+  if (currentComponent) {
+    currentComponent.suspenseBoundary = boundary;
   }
 
-  return instance;
+  return () => {
+    const isPending = state.pendingCount > 0;
+
+    // Current approach: CSS toggling with wrapper divs
+    return {
+      type: 'div',
+      props: {
+        style: 'display: contents',
+        children: [
+          { type: 'div', props: {
+            style: isPending ? 'display: none' : 'display: contents',
+            children: props.children
+          }},
+          isPending ? (props.fallback || text('')) : null
+        ]
+      }
+    };
+  };
 }
 ```
 
-**Key changes:**
-
-- Set `currentComponentInstance` before calling component function
-- This allows `suspend()` to access the instance being created
-- Setup runs once, creating the instance with its render function
-
-### 6. Rendering with Suspension Check
+**After Render Contexts (Clean JSX):**
 
 ```typescript
-// In component.ts
+export function Suspense(props: { fallback?: any; children: any }) {
+  const state = createState({ pendingCount: 0 });
+
+  const currentComponent = getCurrentComponent();
+
+  const boundary: SuspenseBoundary = {
+    addPending: (count: number) => { state.pendingCount += count; },
+    removePending: (count: number) => { state.pendingCount -= count; },
+  };
+
+  if (currentComponent) {
+    currentComponent.suspenseBoundary = boundary;
+
+    // Create TWO render contexts for this component
+    const childrenContext = {
+      contextId: 'children',
+      childPosition: 0,
+      parentInstance: currentComponent
+    };
+
+    const fallbackContext = {
+      contextId: 'fallback',
+      childPosition: 0,
+      parentInstance: currentComponent
+    };
+
+    currentComponent.renderContexts.set('children', childrenContext);
+    currentComponent.renderContexts.set('fallback', fallbackContext);
+  }
+
+  return () => {
+    const isPending = state.pendingCount > 0;
+
+    if (isPending) {
+      // Set active context to fallback
+      if (currentComponent) {
+        const fallbackContext = currentComponent.renderContexts.get('fallback')!;
+        fallbackContext.childPosition = 0; // Reset counter
+        currentComponent.activeContext = fallbackContext;
+      }
+      return props.fallback;
+    } else {
+      // Set active context to children
+      if (currentComponent) {
+        const childrenContext = currentComponent.renderContexts.get('children')!;
+        childrenContext.childPosition = 0; // Reset counter
+        currentComponent.activeContext = childrenContext;
+      }
+      return props.children;
+    }
+  };
+}
+```
+
+**Key improvements with render contexts:**
+
+- No wrapper divs - clean JSX output
+- No CSS display toggling
+- Component instances persist via different key paths:
+  - Children: `"Suspense:0[children]/UserProfile:0"`
+  - Fallback: `"Suspense:0[fallback]/Loading:0"`
+- Simple conditional rendering
+- Active context switches based on `isPending`
+
+### 7. No Special Suspense Rendering Needed
+
+With render contexts, Suspense is treated like any other component:
+
+```typescript
+// In component.ts - renderComponent()
 
 export function renderComponent(type: any, props: any): VNode {
   if (isComponentFunction(type)) {
-    // Special handling for Suspense
-    if (type.name === "Suspense") {
-      return renderSuspenseComponent(type, props);
-    }
-
-    if (type.name === "Fragment") {
+    // Fragment special case
+    if ((type as any).$$typeof === FragmentSymbol) {
       const result = type(props);
       return jsxToVNode(result);
     }
 
-    const { children, key, ...componentProps } = props || {};
+    // All components (including Suspense) use the same flow
+    const { key, ...componentProps } = props || {};
     const instance = createComponentInstance(type, componentProps, key);
 
-    // Check if component is suspended
-    const suspendHandle = componentSuspension.get(instance);
-    if (suspendHandle && suspendHandle.isPending) {
-      // Component not ready yet, return placeholder
-      return text("");
+    // Set this instance as the currently rendering component
+    const previousRenderingComponent = currentRenderingComponent;
+    currentRenderingComponent = instance;
+
+    try {
+      const jsxOutput = instance.render();
+
+      if (jsxOutput && typeof jsxOutput.type === 'function') {
+        const result = renderComponent(jsxOutput.type, jsxOutput.props);
+        currentRenderingComponent = previousRenderingComponent;
+        return result;
+      }
+
+      const vnode = jsxToVNode(jsxOutput);
+      currentRenderingComponent = previousRenderingComponent;
+      return vnode;
+    } catch (error) {
+      currentRenderingComponent = previousRenderingComponent;
+      throw error;
     }
-
-    // Component ready, call render function
-    const jsxOutput = instance.render();
-
-    if (jsxOutput && typeof jsxOutput.type === "function") {
-      return renderComponent(jsxOutput.type, jsxOutput.props);
-    }
-
-    return jsxToVNode(jsxOutput);
   }
 
   return h(type, props || {});
 }
 ```
 
-**Key logic:**
-
-- After creating/getting instance, check if it's suspended
-- If suspended, return empty placeholder (Suspense will show fallback)
-- If not suspended, call render function normally
-
-### 7. Suspense Boundary Stack Management
-
-```typescript
-// In component.ts
-
-function renderSuspenseComponent(type: any, props: any): VNode {
-  const { children, key, ...componentProps } = props || {};
-  const instance = createComponentInstance(type, componentProps, key);
-
-  const boundary = (instance as any).suspenseBoundary as SuspenseInstance;
-
-  // Push boundary BEFORE rendering children
-  suspenseBoundaryStack.push(boundary);
-
-  try {
-    const jsxOutput = instance.render();
-    return jsxToVNode(jsxOutput);
-  } finally {
-    // Always pop, even if error occurs
-    suspenseBoundaryStack.pop();
-  }
-}
-```
-
-The boundary is pushed onto the stack before rendering children, ensuring `suspend()` calls can find the nearest boundary.
-
-### 8. Suspense Component Implementation
-
-```typescript
-// In suspense.ts
-
-import { createState } from "./state";
-import { text } from "superfine";
-
-interface SuspenseProps {
-  fallback?: any;
-  children: any;
-}
-
-export function Suspense(props: SuspenseProps) {
-  const state = createState({
-    pendingPromises: new Set<Promise<any>>(),
-    suspendedCount: 0, // Track how many components are suspended
-  });
-
-  const boundary: SuspenseInstance = {
-    notifySuspended: (promise: Promise<any>) => {
-      if (state.pendingPromises.has(promise)) return;
-
-      state.pendingPromises.add(promise);
-      state.suspendedCount++;
-      // Reactive state change triggers re-render!
-
-      promise.finally(() => {
-        state.pendingPromises.delete(promise);
-        // Don't decrement here - wait for notifyResolved
-      });
-    },
-
-    notifyResolved: () => {
-      // Called when a component's promises all resolve
-      state.suspendedCount--;
-      // Reactive state change triggers re-render!
-    },
-  };
-
-  const render = () => {
-    const isPending = state.suspendedCount > 0;
-
-    if (isPending) {
-      return props.fallback || text("");
-    }
-    return props.children;
-  };
-
-  // Attach boundary so renderSuspenseComponent can access it
-  (render as any).suspenseBoundary = boundary;
-
-  return render;
-}
-```
-
-**Key behaviors:**
-
-- Tracks count of suspended components (`suspendedCount`)
-- Shows fallback when any component is suspended
-- Shows children when all components are resolved
-- Uses reactive state for automatic re-rendering
+No special `renderSuspenseComponent()` function needed! The render context mechanism handles everything.
 
 ## Complete Render Flow
 
@@ -449,41 +405,45 @@ export function Suspense(props: SuspenseProps) {
 </Suspense>
 ```
 
-1. **Suspense renders:** `suspendedCount = 0`, returns children
-2. **Suspense boundary pushed** onto stack
-3. **UserProfile setup runs** (first time, creates instance):
-   - Calls `suspend({ user: fetchUser() })`
-   - `suspend()` sees promise is pending
+1. **Suspense renders:** `pendingCount = 0`, returns children
+2. **UserProfile setup runs** (first time, creates instance):
+   - Calls `createSuspense({ user: fetchUser() })`
+   - `createSuspense()` sees promise is pending
    - Creates reactive `resolvedValues` (empty)
-   - Marks component as suspended
-   - Notifies boundary: `suspendedCount++` (reactive change!)
-   - Returns `resolvedValues` proxy
+   - Finds boundary via parent chain
+   - Schedules `boundary.addPending(1)` via queueMicrotask
+   - Returns `resolvedValues` (values are undefined)
    - Setup completes, returns render function
+3. **Microtask runs:**
+   - Calls `boundary.addPending(1)`
+   - `pendingCount++` (reactive change!)
 4. **Suspense re-renders automatically** (reactive state changed):
-   - `suspendedCount > 0`, shows fallback
-5. **Tries to render UserProfile again:**
-   - Gets existing instance (setup doesn't re-run!)
-   - Checks suspension: component is suspended
-   - Returns empty placeholder
+   - `pendingCount > 0`, shows fallback
+   - Sets `activeContext` to `'fallback'`
+   - Returns `props.fallback`
+5. **Loading component renders in fallback context:**
+   - Key: `"Suspense:0[fallback]/Loading:0"`
 6. **User sees:** Fallback content
 
 ### Promises Resolve
 
 1. **Promise resolves:**
    - Updates cache: `{ status: 'resolved', value: {...} }`
-   - Updates reactive state: `resolvedValues.user = {...}`
-   - All promises done, calls `handle.onResolve()`
-2. **Boundary notified:**
-   - Calls `boundary.notifyResolved()`
-   - `suspendedCount--` (reactive change!)
-3. **Suspense re-renders automatically:**
-   - `suspendedCount = 0`, returns children
-4. **Renders UserProfile:**
+   - Updates reactive state: `resolvedValues.user = {...}` (reactive change!)
+   - Calls `boundary.removePending(1)`
+   - `pendingCount--` (reactive change!)
+2. **Suspense re-renders automatically** (two reactive changes):
+   - `pendingCount = 0`, returns children
+   - Sets `activeContext` to `'children'`
+   - Returns `props.children`
+3. **UserProfile renders in children context:**
    - Gets existing instance (setup doesn't re-run!)
-   - Checks suspension: component NOT suspended
    - Calls `instance.render()`
-   - Render accesses `data.user.name` - values are there!
-5. **User sees:** Actual content
+   - Render accesses `data.user?.name` - value is there!
+   - Key: `"Suspense:0[children]/UserProfile:0"`
+4. **User sees:** Actual content
+
+**Note:** UserProfile instance persists throughout! It's the same instance whether showing fallback or children. The render function just gets called again when data becomes available.
 
 ### Subsequent Renders
 
@@ -537,37 +497,6 @@ When `key` changes:
 
 This is explicit and predictable - parent controls when to refetch by changing the key.
 
-### Alternative: Resource Helper (Optional)
-
-For more complex caching strategies, add a `resource()` helper:
-
-```typescript
-const resourceCache = new Map<string, Promise<any>>();
-
-export function resource<T>(
-  key: string,
-  fetcher: () => Promise<T>
-): Promise<T> {
-  let promise = resourceCache.get(key);
-  if (!promise) {
-    promise = fetcher();
-    resourceCache.set(key, promise);
-  }
-  return promise;
-}
-
-// Usage
-function UserProfile(props: { userId: string }) {
-  const data = suspend({
-    user: resource(`user-${props.userId}`, () => fetchUser(props.userId)),
-  });
-
-  return () => <div>{data.user.name}</div>;
-}
-```
-
-This caches promises by string key, allowing the same promise to be reused when `userId` is accessed again.
-
 ## Advantages of This Approach
 
 ### ✅ Setup Runs Once
@@ -579,66 +508,75 @@ This caches promises by string key, allowing the same promise to be reused when 
 ### ✅ Render Functions Stay Synchronous
 
 - Preserves reactive tracking
-- No need to catch thrown promises during render
-- Values are just there when render is called
+- Values can be undefined initially (use optional chaining)
+- Re-renders automatically when data arrives
 
 ### ✅ Leverages Existing Reactivity
 
-- `suspend()` returns reactive state
+- `createSuspense()` returns reactive state
 - When promises resolve, reactive updates trigger re-render
 - No manual render scheduling needed
 
 ### ✅ Clean Component Lifecycle
 
-- Setup → suspended → resolved
+- Setup → render with undefined → data arrives → re-render with data
 - Clear states, easy to reason about
-- No partial renders or aborted execution
+- Component instance persists throughout
 
 ### ✅ Multiple Promises Just Work
 
-- `suspend()` accepts multiple promises
-- Waits for all to resolve
-- Single notification when all done
+- `createSuspense()` accepts multiple promises
+- Tracks each promise independently
+- Notifies boundary when all resolve
 
 ### ✅ Nested Suspense Works Naturally
 
-- Boundary stack handles multiple levels
-- Each Suspense tracks its own suspended components
+- Parent chain walking handles multiple levels
+- Each Suspense tracks its own pending count
 - Inner boundaries catch suspensions first
+
+### ✅ Clean with Render Contexts
+
+- No wrapper divs needed
+- No CSS display toggling
+- Simple conditional rendering
+- Component instances in different contexts have different keys
 
 ## Error Handling
 
 When a promise rejects:
 
 ```typescript
-// In suspend()
+// In createSuspense()
 if (cache.status === "rejected") {
   throw cache.error;
 }
 ```
 
-This happens during setup, so the error propagates up. Future enhancement: add Error Boundary component to catch these.
+Currently this just logs an error and calls `removePending()`. Future enhancement: add Error Boundary component to catch these.
 
-## Implementation Checklist
+## Implementation Status
 
-### Phase 1: Core Suspense
+### ✅ Phase 1: Core Suspense (Complete)
 
-- [ ] Add `promiseCache` WeakMap for promise status tracking
-- [ ] Add `componentSuspension` WeakMap for suspension state
-- [ ] Add `currentComponentInstance` global tracking
-- [ ] Implement `suspend()` function
-- [ ] Update `createComponentInstance()` to track current instance
-- [ ] Update `renderComponent()` to check suspension state
-- [ ] Add `suspenseBoundaryStack` and `SuspenseInstance` interface
-- [ ] Implement `renderSuspenseComponent()` with boundary stack
-- [ ] Implement `Suspense` component with `suspendedCount` tracking
-- [ ] Export `suspend()` and `Suspense` from library
+- ✅ `promiseCache` WeakMap for promise status tracking
+- ✅ Parent chain walking for boundary discovery (`findNearestSuspenseBoundary`)
+- ✅ `createSuspense()` function implemented
+- ✅ `SuspenseBoundary` interface with `addPending/removePending`
+- ✅ `Suspense` component with reactive `pendingCount` tracking
+- ✅ `createSuspense()` and `Suspense` exported from library
 
-### Phase 2: Resource Helper (Optional)
+### 🔄 Phase 2: Render Contexts Integration (In Progress)
 
-- [ ] Implement `resource()` function with string-key caching
-- [ ] Add cache invalidation API
-- [ ] Add cache clearing utilities
+This requires implementing render contexts first (see RENDER_CONTEXTS.md):
+
+- [ ] Add `renderContexts` Map to ComponentInstance
+- [ ] Add `activeContext` to ComponentInstance
+- [ ] Implement hierarchical key generation with context paths
+- [ ] Update Suspense to create `children` and `fallback` contexts
+- [ ] Switch active context based on `isPending`
+- [ ] Remove CSS wrapper divs from Suspense
+- [ ] Test that component keys are different in different contexts
 
 ### Phase 3: Error Boundaries (Future)
 
@@ -728,11 +666,22 @@ This happens during setup, so the error propagates up. Future enhancement: add E
 
 This design provides a clean, reactive approach to async data fetching:
 
-- `suspend()` in setup phase for declarative data dependencies
-- Component suspension prevents render until data ready
-- Reactive state triggers automatic re-render when resolved
+- `createSuspense()` in setup phase for declarative data dependencies
+- Returns reactive state with values (initially undefined)
+- Render functions execute immediately with optional chaining
+- Reactive state triggers automatic re-render when promises resolve
 - Synchronous render functions preserve reactivity tracking
 - Leverages existing component instance caching
+- Parent chain walking for boundary discovery (no stack needed)
 - Works naturally with nested Suspense boundaries
 
-The API is simple, the implementation is clean, and it integrates seamlessly with the existing reactive component system.
+**With render contexts**, Suspense becomes even cleaner:
+
+- No wrapper divs or CSS hacks
+- Simple conditional rendering (return children or fallback)
+- Component instances persist via different key paths in different contexts
+- Clean separation between `children` and `fallback` rendering
+
+The current implementation works but uses CSS toggling. After implementing render contexts (RENDER_CONTEXTS.md), we'll remove the wrapper divs and switch to pure conditional rendering with multiple render contexts per Suspense boundary.
+
+The API is simple, the implementation is clean, and it integrates seamlessly with the existing reactive component system. No "resource" primitive is needed - direct promise handling works perfectly.

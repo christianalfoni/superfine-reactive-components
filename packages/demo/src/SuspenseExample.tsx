@@ -102,14 +102,14 @@ function UserProfile(props: { userId: string }) {
 
 // Stats component that suspends independently
 function Stats() {
-  console.log('[Stats] SETUP PHASE - this should only run once per instance!');
+  console.log("[Stats] SETUP PHASE - this should only run once per instance!");
 
   const data = createSuspense({
     stats: fetchStats(),
   });
 
   return () => {
-    console.log('[Stats] RENDER - data.stats:', data.stats);
+    console.log("[Stats] RENDER - data.stats:", data.stats);
     return (
       <div style="padding: 20px; background-color: #e8f4f8; border-radius: 8px;">
         <h2 style="margin-top: 0; color: #333;">Statistics</h2>

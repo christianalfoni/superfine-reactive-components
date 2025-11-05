@@ -9,18 +9,23 @@ interface Todo {
   completed: boolean;
 }
 
-function Nested(props) {
+function Nested(props: { children?: any }) {
   return () => <div>{props.children}</div>;
 }
 
 export function App2() {
-  const state = createState({ showFirst: true });
+  const state = createState({ count: 0 });
 
   return () => (
     <div>
-      <h1 onClick={() => (state.showFirst = !state.showFirst)}>Hello There</h1>
-      {state.showFirst ? <Nested>foo</Nested> : null}
-      <Nested>Bar</Nested>
+      <h1
+        onClick={() => {
+          console.log("CLICK");
+          state.count++;
+        }}
+      >
+        Hello There ({state.count})
+      </h1>
     </div>
   );
 }

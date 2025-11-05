@@ -1,4 +1,3 @@
-import { createState } from "@superfine-components/core";
 
 interface TodoItemProps {
   id: number;

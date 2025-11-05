@@ -23,13 +23,19 @@
   ],
   "scripts": {
     "build": "tsc && cp src/jsx.d.ts dist/",
-    "dev": "tsc --watch"
-  },
-  "peerDependencies": {
-    "superfine": "^8.2.0"
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run"
   },
   "devDependencies": {
+    "@vitest/ui": "^4.0.7",
+    "happy-dom": "^20.0.10",
+    "jsdom": "^27.1.0",
     "typescript": "^5.7.3",
-    "superfine": "^8.2.0"
+    "vitest": "^4.0.7"
+  },
+  "dependencies": {
+    "snabbdom": "^3.6.3"
   }
 }

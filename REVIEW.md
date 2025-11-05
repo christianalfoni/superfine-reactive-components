@@ -1,1141 +1,793 @@
-# Implementation Review: Superfine Components
+# Snabbdom Implementation Review
 
-This document provides a thorough review of the Superfine Components implementation, covering memory leaks, architectural concerns, and potential improvements.
-
-## Status Update (2025-11-04)
-
-**📋 MINOR ISSUES IN PROGRESS**
-
-- ✅ **Minor Issue #1**: Duplicate code in createState/createProps - **FIXED** (refactored to shared `createReactiveProxy()`)
-- ⏸️ **Minor Issue #2**: Error boundaries - **PLANNED** (comprehensive implementation plan in `ERROR_BOUNDARY_PLAN.md`)
-- ⏸️ **Minor Issue #3**: Dev mode warnings - **PENDING**
-- ⏸️ **Minor Issue #4**: State update batching - **PENDING**
-- ⏸️ **Minor Issue #5**: Fragment component inconsistency - **PENDING**
-- ⏸️ **Minor Issue #6**: TypeScript strict mode - **PENDING**
-
----
-
-## Status Update (2025-11-03)
-
-**✅ ALL CRITICAL AND MAJOR ISSUES RESOLVED**
-
-All critical and major issues identified below have been addressed:
-
-- ✅ **Critical Issue #1**: Component lifecycle with cleanup implemented
-- ✅ **Critical Issue #2**: Observer cleanup already working correctly
-- ✅ **Major Issue #1**: Nested object proxy caching implemented
-- ✅ **Major Issue #2**: Props deletion handling fixed
-- ✅ **Major Issue #3**: Infinite render loop detection added
-- ✅ **Major Issue #4**: Key-based component reconciliation implemented
-
-See implementation details at the end of this document.
+**Date**: 2025-11-04
+**Reviewer**: Claude Code
+**Scope**: Complete Snabbdom migration implementation
 
 ---
 
 ## Executive Summary
 
-**Overall Assessment:** The implementation is clean, well-structured, and demonstrates solid understanding of reactive patterns. All critical and major memory leak issues have been resolved. Remaining issues are minor improvements and nice-to-have features.
+The Snabbdom implementation successfully achieves complete component isolation using thunks. The codebase is well-structured and the architecture is sound. However, there are several areas for improvement including code duplication, outdated approaches, potential bugs, and optimization opportunities.
 
-**Critical Issues:** 🔴 2 critical ✅ **ALL FIXED**
-**Major Issues:** 🟡 4 major ✅ **ALL FIXED**
-**Minor Issues:** 🟢 6 minor
+**Overall Assessment**:  **Production-Ready with Minor Issues**
 
 ---
 
-## Memory Leak Analysis
+## =4 Critical Issues
 
-### 🔴 Critical Issue #1: No Component Cleanup
+### None Found
 
-**Location:** `src/lib/component.ts:16-17`
+The implementation has no critical bugs that would prevent it from working correctly.
 
-**Problem:**
+---
+
+## =� Code Quality Issues
+
+### 1. **Duplicate Code: `renderComponentContent` Logic** (component.ts)
+
+**Location**: Lines 239-274 (initial render) and Lines 402-440 (re-render)
+
+**Issue**: The logic for rendering component content is duplicated between:
+- `renderComponentContent()` function (called during initial observer run)
+- Observer re-render path (lines 402-440)
+
+**Current Code**:
 ```typescript
-let componentRenderOrder: ComponentInstance<any>[] = [];
-let componentRenderIndex = 0;
-```
+// Initial render (lines 239-274)
+function renderComponentContent(instance: ComponentInstance<any>, cacheKey: string): VNode {
+  instance.childPosition = 0;
+  const previousRenderingComponent = currentRenderingComponent;
+  currentRenderingComponent = instance;
 
-Component instances are stored in a global array that never shrinks. Once a component is created, it persists forever even after being removed from the UI.
+  try {
+    const jsx = instance.render();
+    const childVNodesRaw = jsxToVNode(jsx);
+    const childVNodes = Array.isArray(childVNodesRaw) ? childVNodesRaw : [childVNodesRaw];
 
-**Impact:**
-- Components that are conditionally rendered will accumulate
-- Each instance holds references to state, props, observers
-- Long-running applications will leak memory
-- No way to unmount/cleanup components
+    const data: any = {
+      attrs: { 'data-name': instance.componentFn.name || 'Anonymous' }
+    };
 
-**Example Leak Scenario:**
-```tsx
-function App() {
-  const state = createState({ showModal: false });
-
-  return () => (
-    <div>
-      {state.showModal && <Modal />}  // Modal instance never cleaned up
-    </div>
-  );
-}
-```
-
-**Solution:**
-Implement component lifecycle with cleanup:
-```typescript
-interface ComponentInstance {
-  // ... existing fields
-  dispose?: () => void;  // Cleanup function
-  isActive: boolean;     // Track if component still in tree
-}
-
-// Add cleanup pass after render
-function cleanupInactiveComponents() {
-  componentRenderOrder = componentRenderOrder.filter(instance => {
-    if (!instance.isActive) {
-      instance.dispose?.();
-      return false;
+    if (instance.explicitKey !== undefined && instance.explicitKey !== null) {
+      data.key = instance.explicitKey;
     }
-    return true;
-  });
+
+    const vnode = h('component', data, childVNodes);
+    return vnode;
+  } finally {
+    currentRenderingComponent = previousRenderingComponent;
+  }
 }
-```
 
----
+// Re-render path (lines 402-440) - nearly identical!
+const jsxOutput = instance.render();
+const childVNodesRaw = jsxToVNode(jsxOutput);
+const childVNodes = Array.isArray(childVNodesRaw) ? childVNodesRaw : [childVNodesRaw];
 
-### 🔴 Critical Issue #2: Observer Subscriptions Never Cleaned Up for Unmounted Components
+const reRenderData: any = {
+  attrs: { 'data-name': type.name || 'Anonymous' }
+};
 
-**Location:** `src/lib/state.ts:11-12`
-
-**Problem:**
-```typescript
-const observerSubscriptions = new WeakMap<Listener, Set<{ listeners, property }>>();
-```
-
-While `observerSubscriptions` uses WeakMap (good!), the listeners themselves remain subscribed to properties in `stateMetadata`. When a component is removed from the tree:
-1. Its render function (observer) is still registered in property listener sets
-2. State changes will try to call these observers
-3. Observers execute but component is no longer mounted
-
-**Impact:**
-- Memory leak: observer functions can't be GC'd
-- Performance degradation: unmounted components re-render pointlessly
-- Potential crashes if observers reference disposed resources
-
-**Evidence from code:**
-```typescript
-// state.ts:67-72
-const propertyListeners = listeners.get(property);
-if (propertyListeners) {
-  const listenersToNotify = Array.from(propertyListeners);
-  listenersToNotify.forEach(listener => listener());  // Calls dead observers!
+if (instance.explicitKey !== undefined && instance.explicitKey !== null) {
+  reRenderData.key = instance.explicitKey;
 }
+
+const newHostVNode = h('component', reRenderData, childVNodes);
 ```
 
-**Solution:**
-The `mount()` function returns a dispose function, but it's never called for child components:
+**Recommendation**: Extract common logic into a helper function:
+
 ```typescript
-// component.ts:169-194
-export function mount(componentFn, container): () => void {
-  const dispose = observer(render);
-  return dispose;  // Only works for root component!
-}
-```
+function createHostVNode(
+  instance: ComponentInstance<any>,
+  componentName: string
+): VNode {
+  instance.childPosition = 0;
+  const previousRenderingComponent = currentRenderingComponent;
+  currentRenderingComponent = instance;
 
-Need to:
-1. Track dispose functions for all component instances
-2. Call dispose when component removed from tree
-3. Implement component unmounting logic
+  try {
+    const jsx = instance.render();
+    const childVNodesRaw = jsxToVNode(jsx);
+    const childVNodes = Array.isArray(childVNodesRaw) ? childVNodesRaw : [childVNodesRaw];
 
----
+    const data: any = {
+      attrs: { 'data-name': componentName }
+    };
 
-### 🟡 Major Issue #1: Nested Object Reactivity Memory Leak
+    if (instance.explicitKey !== undefined && instance.explicitKey !== null) {
+      data.key = instance.explicitKey;
+    }
 
-**Location:** `src/lib/state.ts:48-54`
-
-**Problem:**
-```typescript
-if (value !== null && typeof value === 'object') {
-  if (!stateMetadata.has(value)) {
-    return createState(value);  // Creates new proxy on EVERY access!
+    return h('component', data, childVNodes);
+  } finally {
+    currentRenderingComponent = previousRenderingComponent;
   }
 }
 ```
 
-Nested objects are wrapped in proxies on every property access. Each access creates a new proxy wrapper that references the original object.
-
-**Impact:**
-- Repeated access to `state.nested` creates multiple proxy wrappers
-- Each proxy has its own listeners map in `stateMetadata`
-- Previous proxies can't be GC'd because they're in WeakMap
-- Affects both `createState` and `createProps` (duplicate code)
-
-**Example Leak:**
-```tsx
-function Component() {
-  const state = createState({ user: { name: "Alice" } });
-
-  return () => (
-    <div>
-      {state.user.name}  // Creates proxy #1
-      {state.user.name}  // Creates proxy #2
-      {state.user.name}  // Creates proxy #3
-    </div>
-  );
-}
-```
-
-**Solution:**
-Cache nested proxies:
-```typescript
-const nestedProxies = new WeakMap<object, WeakMap<object, object>>();
-
-get(target, property) {
-  const value = Reflect.get(target, property);
-
-  if (value !== null && typeof value === 'object') {
-    if (!stateMetadata.has(value)) {
-      // Check cache first
-      let cache = nestedProxies.get(target);
-      if (!cache) {
-        cache = new WeakMap();
-        nestedProxies.set(target, cache);
-      }
-
-      let proxy = cache.get(value);
-      if (!proxy) {
-        proxy = createState(value);
-        cache.set(value, proxy);
-      }
-      return proxy;
-    }
-  }
-
-  return value;
-}
-```
+**Impact**: Medium - Reduces ~35 lines of duplicate code, improves maintainability
 
 ---
 
-### 🟡 Major Issue #2: Props Updates Don't Handle Deleted Properties
+### 2. **Inconsistent Component Name Access** (component.ts)
 
-**Location:** `src/lib/state.ts:214-240`
+**Location**: Lines 259 vs 417
 
-**Problem:**
+**Issue**: Component name is accessed differently in initial render vs re-render:
+- Initial render: `instance.componentFn.name || 'Anonymous'` (line 259)
+- Re-render: `type.name || 'Anonymous'` (line 417)
+
+The re-render path uses `type` which is the component function from the outer scope, while initial render uses `instance.componentFn`. Both should use `instance.componentFn` for consistency.
+
+**Recommendation**:
 ```typescript
-export function updateProps<T extends object>(proxy: T, newProps: Partial<T>) {
-  for (const key in newProps) {
-    const newValue = newProps[key];
-    const oldValue = (target as any)[key];
+// In re-render path (line 417), change:
+attrs: { 'data-name': type.name || 'Anonymous' }
+// To:
+attrs: { 'data-name': instance.componentFn.name || 'Anonymous' }
+```
 
-    if (oldValue !== newValue) {
-      (target as any)[key] = newValue;
-      // Notify observers
-    }
+**Impact**: Low - Doesn't affect functionality but improves consistency
+
+---
+
+### 3. **Unused WeakMap** (component.ts)
+
+**Location**: Lines 126-128
+
+**Issue**: `instancesByElement` WeakMap is declared but never used:
+
+```typescript
+// Map to track component instances by their host DOM element
+// This allows reusing instances when the same component renders again
+const instancesByElement = new WeakMap<HTMLElement, ComponentInstance<any>>();
+```
+
+This appears to be leftover from the Superfine implementation.
+
+**Recommendation**: Remove unused code:
+
+```typescript
+// DELETE lines 126-128
+```
+
+**Impact**: Low - Dead code removal, small performance improvement
+
+---
+
+### 4. **Obsolete `observableRender` Function** (component.ts)
+
+**Location**: Lines 358-375
+
+**Issue**: The `observableRender` function has an obsolete branch:
+
+```typescript
+const observableRender = () => {
+  const hostElement = instance.hostElement;
+
+  // If hostElement exists, we're in a re-render (shouldn't happen via thunk)
+  if (hostElement) {
+    return (instance as any)._cachedVNode;  // � This branch never executes
   }
+
+  // Initial render - generate vnode
+  const vnode = renderComponentContent(instance, cacheKey);
+  (instance as any)._cachedVNode = vnode;
+  return vnode;
+};
+```
+
+The comment states this branch "shouldn't happen", and indeed it never does because:
+1. `observableRender` is only called from the observer's first run (line 396)
+2. At that point, `hostElement` is always null (checked at line 395)
+
+**Recommendation**: Simplify to:
+
+```typescript
+const observableRender = () => {
+  // Initial render only - hostElement is always null here
+  const vnode = renderComponentContent(instance, cacheKey);
+  (instance as any)._cachedVNode = vnode;
+  return vnode;
+};
+```
+
+**Impact**: Low - Removes dead code path, improves clarity
+
+---
+
+### 5. **Missing Type Safety for `_cachedVNode`** (component.ts)
+
+**Location**: Multiple locations (lines 368, 373, 398, 445)
+
+**Issue**: `_cachedVNode` is accessed via `(instance as any)._cachedVNode`, losing type safety.
+
+**Recommendation**: Add `_cachedVNode` to the `ComponentInstance` interface:
+
+```typescript
+export interface ComponentInstance<P extends object = {}> {
+  // ... existing fields ...
+
+  // Internal: Cached vnode returned by thunk (stability required for Snabbdom)
+  _cachedVNode?: VNode;
 }
 ```
 
-Only iterates over `newProps`, so properties removed from props are never deleted from the target object.
+Then remove all `(instance as any)` casts.
 
-**Impact:**
-- Stale props remain in component
-- Component may access old prop values
-- Memory leak from unreferenced data
+**Impact**: Medium - Improves type safety, prevents potential bugs
 
-**Example Bug:**
-```tsx
-// Render 1: <Child name="Alice" age={30} />
-// Child has: { name: "Alice", age: 30 }
+---
 
-// Render 2: <Child name="Bob" />
-// Child still has: { name: "Bob", age: 30 }  // age should be undefined!
+## =� Optimization Opportunities
+
+### 1. **Unnecessary Array Wrapping in `jsxToVNode`** (component.ts)
+
+**Location**: Lines 253-254, 408-409, 556-566
+
+**Issue**: Children are always wrapped in an array even when already normalized:
+
+```typescript
+const childVNodesRaw = jsxToVNode(jsx);
+const childVNodes = Array.isArray(childVNodesRaw) ? childVNodesRaw : [childVNodesRaw];
 ```
 
-**Solution:**
+This creates unnecessary array allocations when `jsxToVNode` returns a single VNode.
+
+**Recommendation**: Have `jsxToVNode` always return an array, or add a `jsxToVNodeArray` helper:
+
+```typescript
+function jsxToVNodeArray(jsx: any): VNode[] {
+  const result = jsxToVNode(jsx);
+  return Array.isArray(result) ? result : [result];
+}
+```
+
+**Impact**: Low - Minor performance improvement (avoids allocations)
+
+---
+
+### 2. **Repeated Props Validation** (state.ts)
+
+**Location**: Lines 249-262, 265-275
+
+**Issue**: `updateProps` iterates over properties twice:
+1. First loop: Update changed properties
+2. Second loop: Delete removed properties
+
+**Recommendation**: Combine into a single loop:
+
 ```typescript
 export function updateProps<T extends object>(proxy: T, newProps: Partial<T>) {
   const target = propsTargets.get(proxy);
-  if (!target) return;
+  if (!target) {
+    console.warn('updateProps called on non-props object');
+    return;
+  }
 
   const listeners = stateMetadata.get(target);
   if (!listeners) return;
 
-  // Get all existing keys
-  const existingKeys = new Set(Object.keys(target));
   const newKeys = new Set(Object.keys(newProps));
 
-  // Update/add properties
+  // Handle updates and additions
   for (const key in newProps) {
     const newValue = newProps[key];
     const oldValue = (target as any)[key];
 
     if (oldValue !== newValue) {
       (target as any)[key] = newValue;
-
       const propertyListeners = listeners.get(key);
       if (propertyListeners) {
-        Array.from(propertyListeners).forEach(listener => listener());
+        propertyListeners.forEach(listener => scheduleNotification(listener));
       }
     }
   }
 
-  // Delete removed properties
-  for (const key of existingKeys) {
+  // Handle deletions
+  for (const key in target) {
     if (!newKeys.has(key)) {
       delete (target as any)[key];
-
       const propertyListeners = listeners.get(key);
       if (propertyListeners) {
-        Array.from(propertyListeners).forEach(listener => listener());
+        propertyListeners.forEach(listener => scheduleNotification(listener));
       }
     }
   }
 }
 ```
 
----
-
-### 🟡 Major Issue #3: Infinite Re-render Risk
-
-**Location:** `src/lib/component.ts:175-187`
-
-**Problem:**
-```typescript
-function render() {
-  resetComponentRenderOrder();
-  const instance = createComponentInstance(componentFn);
-  const jsxOutput = instance.render();
-  const newVNode = jsxToVNode(jsxOutput);
-  rootNode = patch(rootNode, newVNode);
-}
-
-const dispose = observer(render);
-```
-
-No safeguard against infinite render loops. If a component modifies state during render, it triggers another render immediately.
-
-**Impact:**
-- Stack overflow from infinite recursion
-- Browser freeze
-- No error message to help debug
-
-**Example:**
-```tsx
-function BadComponent() {
-  const state = createState({ count: 0 });
-
-  return () => {
-    state.count++;  // Modifies state during render!
-    return <div>{state.count}</div>;
-  };
-}
-```
-
-**Solution:**
-Add render loop detection:
-```typescript
-let renderDepth = 0;
-const MAX_RENDER_DEPTH = 100;
-
-function render() {
-  renderDepth++;
-
-  if (renderDepth > MAX_RENDER_DEPTH) {
-    renderDepth = 0;
-    throw new Error('Maximum render depth exceeded. Possible infinite render loop.');
-  }
-
-  try {
-    resetComponentRenderOrder();
-    const instance = createComponentInstance(componentFn);
-    const jsxOutput = instance.render();
-    const newVNode = jsxToVNode(jsxOutput);
-    rootNode = patch(rootNode, newVNode);
-  } finally {
-    // Reset after successful render
-    setTimeout(() => { renderDepth = 0; }, 0);
-  }
-}
-```
+**Impact**: Low - Slight performance improvement for prop updates
 
 ---
 
-### 🟡 Major Issue #4: Component Identity by Position is Fragile
+### 3. **Console Logs in Production Code** (suspense.ts)
 
-**Location:** `src/lib/component.ts:22-24, 34-36`
+**Location**: Lines 204, 208, 212, 225
 
-**Problem:**
+**Issue**: Debug console.log statements are left in production code:
+
 ```typescript
-export function resetComponentRenderOrder() {
-  componentRenderIndex = 0;  // Resets every render
-}
-
-const currentIndex = componentRenderIndex++;
-let instance = componentRenderOrder[currentIndex];
+console.log('[Suspense] SETUP - instance:', componentInstance?.id.toString());
+console.log('[Suspense] addPending:', count, '-> new count:', state.pendingCount + count, 'instance:', componentInstance?.id.toString());
+console.log('[Suspense] removePending:', count, '-> new count:', state.pendingCount - count, 'instance:', componentInstance?.id.toString());
+console.log('[Suspense] RENDER - pendingCount:', state.pendingCount, 'isPending:', isPending, 'instance:', componentInstance?.id.toString(), 'children:', props.children);
 ```
 
-Components are identified purely by their position in the render tree. This breaks when:
-- Conditional rendering changes order
-- List items are reordered
-- Components are dynamically added/removed
+**Recommendation**: Either:
+1. Remove entirely for production
+2. Wrap in a debug flag: `if (__DEV__) console.log(...)`
+3. Use a proper logging system
 
-**Impact:**
-- Wrong component instances matched
-- State assigned to wrong components
-- Confusing bugs that are hard to debug
-
-**Example Bug:**
-```tsx
-function App() {
-  const state = createState({ showFirst: true });
-
-  return () => (
-    <div>
-      {state.showFirst && <CounterA />}  // Position 0
-      <CounterB />  // Position 0 or 1 depending on showFirst
-    </div>
-  );
-}
-```
-
-When `showFirst` changes, CounterB moves from position 1 to position 0, inheriting CounterA's instance!
-
-**Solution:**
-Implement key-based reconciliation:
-```typescript
-interface ComponentInstance {
-  key?: any;
-  componentFn: ComponentFunction;
-  render: RenderFunction;
-  props: any;
-}
-
-const componentsByKey = new Map<any, ComponentInstance>();
-let keyIndex = 0;
-
-export function createComponentInstance<P>(
-  componentFn: ComponentFunction<P>,
-  props?: P,
-  key?: any
-): ComponentInstance<P> {
-  // Use explicit key or fallback to position + function identity
-  const instanceKey = key ?? `${keyIndex}_${componentFn.name}`;
-  keyIndex++;
-
-  let instance = componentsByKey.get(instanceKey);
-
-  if (!instance || instance.componentFn !== componentFn) {
-    // Create new instance
-    instance = { /* ... */ };
-    componentsByKey.set(instanceKey, instance);
-  }
-
-  return instance;
-}
-```
+**Impact**: Low - Reduces noise, improves performance slightly
 
 ---
 
-## Architectural Issues
+## � Potential Bugs
 
-### 🟢 Minor Issue #1: Duplicate Code in createState and createProps
+### 1. **Race Condition in Suspense Resolution** (suspense.ts)
 
-**Location:** `src/lib/state.ts:21-80, 143-208`
+**Location**: Lines 146-149, 155-157
 
-**Problem:**
-The implementations of `createState` and `createProps` are nearly identical (88% duplicate code). Only difference is the `propsTargets` WeakMap registration.
+**Issue**: Promise resolution uses `queueMicrotask` to defer state updates, which could cause timing issues:
 
-**Impact:**
-- Maintenance burden (fix bugs twice)
-- Increased bundle size
-- Easy to introduce inconsistencies
-
-**Solution:**
-Extract common logic:
 ```typescript
-function createReactiveProxy<T extends object>(
-  target: T,
-  options?: { trackTarget?: boolean }
-): T {
-  const listeners = new Map<string | symbol, Set<Listener>>();
-  stateMetadata.set(target, listeners);
-
-  const proxy = new Proxy(target, {
-    get(target, property) { /* ... */ },
-    set(target, property, value) { /* ... */ }
-  });
-
-  if (options?.trackTarget) {
-    propsTargets.set(proxy, target);
-  }
-
-  return proxy;
-}
-
-export function createState<T>(initialState: T): T {
-  return createReactiveProxy(initialState);
-}
-
-export function createProps<T>(initialProps: T): T {
-  const target = { ...initialProps };
-  return createReactiveProxy(target, { trackTarget: true });
-}
-```
-
-**Status (2025-11-04):**
-✅ **FIXED**. Refactored to extract common proxy logic into `createReactiveProxy()` function.
-- Eliminated ~140 lines of duplicate code
-- Both `createState()` and `createProps()` now use shared implementation
-- Reduced from ~145 lines to ~8 lines combined
-- All functionality preserved and tested
-
-**Location:** `src/lib/state.ts:30-120, 183-189`
-
----
-
-### 🟢 Minor Issue #2: No Error Boundaries
-
-**Location:** N/A - Missing feature
-
-**Problem:**
-If a component throws an error during render, the entire app crashes with no recovery mechanism.
-
-**Impact:**
-- Poor user experience
-- No way to gracefully handle errors
-- Can't show fallback UI
-
-**Solution:**
-Implement error boundary components:
-```typescript
-interface ErrorBoundaryProps {
-  fallback: (error: Error) => any;
-  children: any;
-}
-
-export function ErrorBoundary(props: ErrorBoundaryProps) {
-  const state = createState({ error: null as Error | null });
-
-  return () => {
-    if (state.error) {
-      return props.fallback(state.error);
-    }
-
-    try {
-      return props.children;
-    } catch (error) {
-      state.error = error as Error;
-      return props.fallback(error as Error);
-    }
-  };
-}
-```
-
-**Status (2025-11-04):**
-⏸️ **Implementation postponed.** A comprehensive implementation plan has been created in `ERROR_BOUNDARY_PLAN.md` that covers:
-- Global error boundary stack for nested boundaries
-- Integration with component rendering system
-- queueMicrotask-based state updates to prevent infinite render loops
-- Edge case handling (async errors, event handlers, infinite loops)
-- Full API design with examples
-
-The plan is ready for implementation when needed.
-
----
-
-### 🟢 Minor Issue #3: No Dev Mode Warnings
-
-**Location:** Throughout codebase
-
-**Problem:**
-No warnings for common mistakes:
-- Destructuring props
-- Modifying state during render
-- Incorrect component patterns
-- Performance issues
-
-**Impact:**
-- Hard to debug issues
-- Easy to make mistakes
-- No guidance for developers
-
-**Solution:**
-Add development mode checks:
-```typescript
-const isDev = process.env.NODE_ENV !== 'production';
-
-export function createState<T>(initialState: T): T {
-  if (isDev && !isInsideComponent()) {
-    console.warn('createState called outside component - state will not be tracked');
-  }
-
-  // ... rest of implementation
-}
-
-// In proxy get handler
-get(target, property) {
-  if (isDev && currentObserver && isRenderPhase()) {
-    // Track props access patterns
-    trackPropsAccess(target, property);
-  }
-  // ...
-}
-
-// After render
-if (isDev) {
-  warnAboutPropsDestructuring();
-  warnAboutStateModificationDuringRender();
-}
-```
-
----
-
-### 🟢 Minor Issue #4: No Batching for State Updates
-
-**Location:** `src/lib/state.ts:59-76`
-
-**Problem:**
-Every state change triggers immediate re-render:
-```typescript
-set(target, property, value) {
-  if (oldValue !== value) {
-    Reflect.set(target, property, value);
-
-    const listenersToNotify = Array.from(propertyListeners);
-    listenersToNotify.forEach(listener => listener());  // Immediate!
-  }
-}
-```
-
-Multiple state changes in same function cause multiple renders.
-
-**Impact:**
-- Performance issues with multiple updates
-- Intermediate states visible to user
-- Unnecessary VDOM diffs
-
-**Example:**
-```tsx
-function handleClick() {
-  state.firstName = "John";   // Render 1
-  state.lastName = "Doe";     // Render 2
-  state.age = 30;             // Render 3
-  // Should be single render!
-}
-```
-
-**Solution:**
-Batch updates in microtask:
-```typescript
-let pendingNotifications = new Set<Listener>();
-let isNotificationScheduled = false;
-
-function scheduleNotification(listener: Listener) {
-  pendingNotifications.add(listener);
-
-  if (!isNotificationScheduled) {
-    isNotificationScheduled = true;
+promise.then(
+  (value) => {
+    cache!.status = 'resolved';
+    cache!.value = value;
     queueMicrotask(() => {
-      const listeners = Array.from(pendingNotifications);
-      pendingNotifications.clear();
-      isNotificationScheduled = false;
-
-      listeners.forEach(listener => listener());
+      resolvedValues[key] = value;  // � Deferred
+      boundary.removePending(1);
     });
   }
-}
+)
+```
 
-set(target, property, value) {
-  if (oldValue !== value) {
-    Reflect.set(target, property, value);
+If multiple promises resolve in the same microtask, the boundary's `pendingCount` might temporarily be incorrect.
 
-    const propertyListeners = listeners.get(property);
-    if (propertyListeners) {
-      propertyListeners.forEach(listener => scheduleNotification(listener));
+**Scenario**:
+1. Promise A resolves � schedules microtask to decrement `pendingCount`
+2. Promise B resolves � schedules microtask to decrement `pendingCount`
+3. Microtask A runs � `pendingCount` goes from 2 to 1
+4. Suspense re-renders with `pendingCount = 1` (still pending)
+5. Microtask B runs � `pendingCount` goes from 1 to 0
+6. Suspense re-renders with `pendingCount = 0` (resolved)
+
+This causes an extra re-render.
+
+**Recommendation**: Batch the decrements:
+
+```typescript
+let pendingDecrements = 0;
+let decrementScheduled = false;
+
+promise.then(
+  (value) => {
+    cache!.status = 'resolved';
+    cache!.value = value;
+    resolvedValues[key] = value;
+
+    pendingDecrements++;
+    if (!decrementScheduled) {
+      decrementScheduled = true;
+      queueMicrotask(() => {
+        boundary.removePending(pendingDecrements);
+        pendingDecrements = 0;
+        decrementScheduled = false;
+      });
     }
   }
-}
+)
 ```
+
+**Impact**: Medium - Reduces unnecessary re-renders in Suspense
 
 ---
 
-### 🟢 Minor Issue #5: Fragment Component Inconsistency
+### 2. **Memory Leak in Promise Cache** (suspense.ts)
 
-**Location:** `src/lib/component.ts:77-84`, `src/lib/jsx.ts:29-31`
+**Location**: Lines 54, 137
 
-**Problem:**
-Fragment is handled as special case by checking function name:
+**Issue**: Resolved/rejected promises are never removed from the WeakMap cache:
+
 ```typescript
-if (type.name === 'Fragment') {
-  const result = type(props);
-  return jsxToVNode(result);
-}
+const promiseCache = new WeakMap<Promise<any>, PromiseCache<any>>();
+
+// Later...
+cache = { status: 'pending' };
+promiseCache.set(promise, cache);
+// Cache entry is never removed after resolution!
 ```
 
-**Issues:**
-- Relies on function name (breaks with minification)
-- Doesn't follow component pattern
-- Special-cased in multiple places
+While WeakMap allows garbage collection of the promise itself, if the promise is kept alive (e.g., stored in component closure), the cache entry persists indefinitely.
 
-**Solution:**
-Use a symbol for Fragment identity:
+**Recommendation**: Add a cache eviction strategy or accept this as intentional caching behavior. If it's intentional, document it clearly:
+
 ```typescript
-// jsx.ts
-export const FragmentSymbol = Symbol('Fragment');
-
-export function Fragment(props?: { children?: any }): any {
-  return props?.children;
-}
-
-Fragment.$$typeof = FragmentSymbol;
-
-// component.ts
-if (type.$$typeof === FragmentSymbol) {
-  // Handle fragment
-}
+/**
+ * WeakMap cache for promise status tracking
+ * Allows the same promise to be recognized across renders
+ *
+ * Note: Cache entries are NOT evicted after resolution.
+ * This is intentional - it allows reusing resolved values across
+ * component remounts. The WeakMap ensures entries are GC'd when
+ * promises are no longer referenced.
+ */
+const promiseCache = new WeakMap<Promise<any>, PromiseCache<any>>();
 ```
+
+**Impact**: Low - Document behavior to clarify intent
 
 ---
 
-### 🟢 Minor Issue #6: No TypeScript Strict Mode for Library Code
+### 3. **Incorrect Ref Hook Merging** (component.ts)
 
-**Location:** `tsconfig.json`
+**Location**: Lines 577-591
 
-**Current:**
-```json
-{
-  "compilerOptions": {
-    "strict": true
-  }
-}
-```
-
-**Issue:**
-While strict mode is enabled, some additional checks would help:
-- `noUncheckedIndexedAccess` - Accessing arrays/objects
-- `exactOptionalPropertyTypes` - Optional prop handling
-- `noPropertyAccessFromIndexSignature` - Safer property access
-
-**Solution:**
-```json
-{
-  "compilerOptions": {
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noPropertyAccessFromIndexSignature": true
-  }
-}
-```
-
----
-
-## Performance Concerns
-
-### 1. Every Render Resets Component Index
-
-**Location:** `src/lib/component.ts:22-24`
-
-Resetting `componentRenderIndex = 0` every render is fine for small apps, but with deep component trees:
-- O(n) lookup through `componentRenderOrder` array
-- No early bailout for unchanged components
-- Every component re-renders even if props didn't change
-
-**Improvement:**
-Implement shouldComponentUpdate equivalent:
-```typescript
-interface ComponentInstance {
-  // ...
-  lastProps?: any;
-}
-
-function shouldUpdate(instance: ComponentInstance, newProps: any): boolean {
-  if (!instance.lastProps) return true;
-
-  // Shallow comparison
-  for (const key in newProps) {
-    if (newProps[key] !== instance.lastProps[key]) return true;
-  }
-
-  return false;
-}
-```
-
-### 2. JSX to VNode Conversion Every Render
-
-**Location:** `src/lib/component.ts:111-161`
-
-The `jsxToVNode` function processes entire component tree on every render. While Superfine's patch is efficient, we're still:
-- Creating new VNode objects
-- Processing all attributes
-- Converting event handler names
-
-**Improvement:**
-Cache static VNode structures:
-```typescript
-const vNodeCache = new WeakMap<Function, VNode>();
-
-function jsxToVNode(jsx: any, isStatic = false): VNode {
-  if (isStatic && typeof jsx === 'object') {
-    const cached = vNodeCache.get(jsx);
-    if (cached) return cached;
-  }
-
-  // ... convert to VNode
-
-  if (isStatic) {
-    vNodeCache.set(jsx, vnode);
-  }
-
-  return vnode;
-}
-```
-
-### 3. Array.from() Called on Every Notification
-
-**Location:** `src/lib/state.ts:70-72, 195-197`
+**Issue**: When a ref is set on an element, the code creates insert/destroy hooks. But if the vnode already has hooks (e.g., from a component), they will be overwritten:
 
 ```typescript
-const listenersToNotify = Array.from(propertyListeners);
-listenersToNotify.forEach(listener => listener());
-```
+if (ref) {
+  if (!vnode.data) vnode.data = {};
+  if (!vnode.data.hook) vnode.data.hook = {};
 
-Creating arrays on every state change adds overhead.
+  vnode.data.hook.insert = (vn: VNode) => {  // � Overwrites existing hook!
+    if (typeof ref === 'function') {
+      ref(vn.elm);
+    } else if (typeof ref === 'object' && 'current' in ref) {
+      ref.current = vn.elm;
+    }
+  };
 
-**Improvement:**
-Iterate Set directly:
-```typescript
-for (const listener of propertyListeners) {
-  listener();
-}
-```
-
----
-
-## Security Concerns
-
-### 1. No Sanitization of Dynamic Content
-
-**Location:** `src/lib/component.ts:116-118`
-
-Text content is not sanitized:
-```typescript
-if (typeof jsx === 'string' || typeof jsx === 'number') {
-  return text(String(jsx));
-}
-```
-
-While Superfine's `text()` should handle this, if user data flows into HTML attributes, XSS is possible:
-```tsx
-<div dangerouslySetInnerHTML={{ __html: userInput }} />
-```
-
-**Recommendation:**
-Document that library doesn't support `dangerouslySetInnerHTML` and all content is text-escaped.
-
-### 2. No Protection Against Prototype Pollution
-
-**Location:** `src/lib/state.ts`
-
-State objects don't prevent prototype pollution:
-```typescript
-state.__proto__.polluted = 'hack';
-```
-
-**Improvement:**
-Use Object.create(null) for state targets:
-```typescript
-export function createState<T>(initialState: T): T {
-  const target = Object.create(null);
-  Object.assign(target, initialState);
-  // ... create proxy
-}
-```
-
----
-
-## Suggested Architecture Improvements
-
-### 1. Context API for Prop Drilling
-
-**Current Gap:** No way to pass data through component tree without prop drilling.
-
-**Suggestion:**
-```typescript
-export function createContext<T>(defaultValue: T) {
-  const contextKey = Symbol('context');
-  let currentValue = defaultValue;
-
-  return {
-    Provider: (props: { value: T; children: any }) => {
-      return () => {
-        currentValue = props.value;
-        return props.children;
-      };
-    },
-
-    useContext: (): T => {
-      return currentValue;
+  vnode.data.hook.destroy = (vn: VNode) => {  // � Overwrites existing hook!
+    if (typeof ref === 'function') {
+      ref(null);
+    } else if (typeof ref === 'object' && 'current' in ref) {
+      ref.current = null;
     }
   };
 }
 ```
 
-### 2. Computed Values
+**Recommendation**: Merge with existing hooks:
 
-**Current Gap:** No memoization for expensive computations.
-
-**Suggestion:**
 ```typescript
-export function computed<T>(fn: () => T): { value: T } {
-  let cache: T;
-  let dirty = true;
+if (ref) {
+  if (!vnode.data) vnode.data = {};
+  if (!vnode.data.hook) vnode.data.hook = {};
 
-  const dispose = observer(() => {
-    dirty = true;
-  });
+  const existingInsert = vnode.data.hook.insert;
+  vnode.data.hook.insert = (vn: VNode) => {
+    // Call existing hook first
+    if (existingInsert) existingInsert(vn);
 
-  return {
-    get value() {
-      if (dirty) {
-        cache = fn();
-        dirty = false;
-      }
-      return cache;
+    // Then set ref
+    if (typeof ref === 'function') {
+      ref(vn.elm);
+    } else if (typeof ref === 'object' && 'current' in ref) {
+      ref.current = vn.elm;
     }
   };
-}
-```
 
-### 3. Effect System
+  const existingDestroy = vnode.data.hook.destroy;
+  vnode.data.hook.destroy = (vn: VNode) => {
+    // Clear ref first
+    if (typeof ref === 'function') {
+      ref(null);
+    } else if (typeof ref === 'object' && 'current' in ref) {
+      ref.current = null;
+    }
 
-**Current Gap:** No way to run side effects in response to state changes.
-
-**Suggestion:**
-```typescript
-export function effect(fn: () => void | (() => void)): () => void {
-  let cleanup: (() => void) | void;
-
-  const dispose = observer(() => {
-    cleanup?.();
-    cleanup = fn();
-  });
-
-  return () => {
-    cleanup?.();
-    dispose();
+    // Then call existing hook
+    if (existingDestroy) existingDestroy(vn);
   };
 }
 ```
 
-### 4. Dev Tools Integration
+**Impact**: High - Prevents hooks from being lost (though unlikely to occur in practice since refs are typically on DOM elements, not components)
 
-**Current Gap:** No way to inspect state, component tree, or re-renders.
+---
 
-**Suggestion:**
-Add hooks for dev tools:
+## =� Architecture & Design
+
+### Strengths
+
+1. ** Thunk-Based Isolation**: Excellent use of Snabbdom thunks for component isolation
+2. ** Reactive Props System**: Elegant solution using Proxy-based reactivity
+3. ** Immediate Instance Registration**: Fix for Suspense loop is correct
+4. ** Component Lifecycle**: Clean separation of setup and render phases
+5. ** Context System**: Solid implementation with late-binding to avoid circular dependencies
+6. ** Suspense Architecture**: Clever use of CSS to show/hide branches while preserving instances
+
+### Areas for Improvement
+
+1. **= Documentation**: Some complex areas (like thunk wrapping) could use more inline comments
+2. **= Error Handling**: Limited error boundaries (noted as TODO in suspense.ts:158)
+3. **= Dev Tools**: No debugging infrastructure (React DevTools equivalent)
+
+---
+
+## =' Recommended Refactoring
+
+### Priority Order
+
+**High Priority** (Do Soon):
+1. Fix ref hook merging (Bug #3) - Prevents potential hook loss
+2. Add `_cachedVNode` to ComponentInstance interface (Issue #5) - Type safety
+3. Remove `instancesByElement` dead code (Issue #3) - Cleanup
+
+**Medium Priority** (Next Sprint):
+4. Extract duplicate rendering logic (Issue #1) - Maintainability
+5. Fix component name consistency (Issue #2) - Code quality
+6. Batch Suspense promise decrements (Bug #1) - Performance
+
+**Low Priority** (Future):
+7. Simplify `observableRender` (Issue #4) - Clarity
+8. Optimize array wrapping (Optimization #1) - Performance
+9. Combine props validation loops (Optimization #2) - Performance
+10. Remove/gate console.logs (Optimization #3) - Production readiness
+11. Document promise cache behavior (Bug #2) - Documentation
+
+---
+
+## =� Metrics
+
+### Code Quality Score: **8.5/10**
+
+**Breakdown**:
+- Architecture: 9/10 (excellent design)
+- Code Organization: 8/10 (good structure, some duplication)
+- Type Safety: 7/10 (some `any` casts)
+- Documentation: 8/10 (good comments, could be better)
+- Error Handling: 7/10 (basic coverage, missing boundaries)
+- Testing: N/A (no tests in scope)
+
+### Technical Debt: **Low to Medium**
+
+The implementation is production-ready with known issues. Technical debt is manageable and mostly consists of optimization opportunities rather than fundamental problems.
+
+---
+
+##  What Works Well
+
+1. **Thunk Architecture**: The core thunk-based isolation is implemented correctly and efficiently
+2. **Reactivity System**: Clean, well-designed reactive state and props
+3. **Component Lifecycle**: Clear separation of concerns
+4. **Child Instance Caching**: The fix for Suspense loop (immediate registration) is correct
+5. **Module Organization**: Good file structure with clear responsibilities
+6. **No Breaking Changes**: Migration preserved public API
+
+---
+
+## <� Conclusion
+
+The Snabbdom implementation is **solid and production-ready**. The architecture achieves its goal of complete component isolation through thunks. While there are opportunities for improvement (primarily code duplication and minor optimizations), there are no critical bugs that would prevent deployment.
+
+**Recommendation**: Address high-priority issues before production deployment, then tackle medium and low priority items incrementally.
+
+The migration from Superfine to Snabbdom was successful and the resulting codebase is maintainable and performant.
+
+---
+
+## 🔍 Snabbdom Features Review
+
+**Date**: 2025-11-05
+**Purpose**: Evaluate Snabbdom modules and features for potential integration
+
+### Currently Used Features ✅
+
+1. **Core API (`h`, `init`, `patch`)** - In use
+2. **Attributes Module** - In use for `data-name` attributes
+3. **Props Module** - In use for element properties
+4. **Class Module** - In use for CSS classes
+5. **Style Module** - In use for inline styles
+6. **EventListeners Module** - In use for event handling
+7. **Thunks** - **Successfully implemented for component isolation!**
+
+### Available But Not Yet Used Features
+
+#### 1. **Style Module - Delayed Animations** 🎨
+
+**What it does**: Declaratively animate element entry/exit using CSS transitions.
+
+**Example**:
 ```typescript
-interface DevToolsHooks {
-  onComponentMount?(instance: ComponentInstance): void;
-  onComponentUpdate?(instance: ComponentInstance): void;
-  onStateChange?(target: object, property: string, value: any): void;
-}
+h('span', {
+  style: {
+    opacity: '0',
+    transition: 'opacity 1s',
+    delayed: { opacity: '1' }  // Applied after next frame
+  }
+}, 'Fade in!')
 
-export function __DEV_TOOLS_HOOK__(hooks: DevToolsHooks) {
-  // Called by dev tools extension
-}
+// For removal:
+h('span', {
+  style: {
+    opacity: '1',
+    transition: 'opacity 1s',
+    destroy: { opacity: '0' }  // Applied before removal
+  }
+}, 'Fade out!')
 ```
 
----
+**Benefits**:
+- Easy enter/exit animations without JavaScript
+- Declarative animation API
+- Works with CSS transitions
+- No additional libraries needed
 
-## Testing Recommendations
+**Recommendation**: ⭐ **Consider exposing this feature**
+- Would enhance `Suspense` fallback transitions
+- Useful for list animations
+- Fits declarative component model
 
-The project has no tests. Recommended test coverage:
-
-### Unit Tests
-- State reactivity (get/set tracking)
-- Observer subscription/unsubscription
-- Props updates and reactivity
-- Component lifecycle
-- JSX to VNode conversion
-
-### Integration Tests
-- Parent-child communication
-- Multiple state updates
-- Conditional rendering
-- List rendering
-- Fragment handling
-
-### Memory Leak Tests
-- Component mount/unmount cycles
-- State creation/destruction
-- Observer cleanup
-- Props object lifecycle
-
-### Performance Tests
-- Render time with deep trees
-- State update batching
-- VDOM patch efficiency
+**Implementation Effort**: Low - Style module already included, just need to expose in JSX types
 
 ---
 
-## Conclusion
+#### 2. **Dataset Module** 📊
 
-### Summary of Critical Issues
+**What it does**: Manage `data-*` attributes separately from regular attributes.
 
-1. **Component cleanup:** No way to unmount components, leading to memory leaks
-2. **Observer cleanup:** Unmounted component observers still subscribed
-3. **Nested object proxies:** New proxies created on every access
-4. **Props deletion:** Removed props not deleted from component
-5. **Infinite render loops:** No safeguard against render loops
-6. **Component identity:** Position-based identity is fragile
-
-### Recommended Priorities
-
-**Phase 1 (Critical - Do First):**
-1. Implement component lifecycle with cleanup
-2. Fix observer cleanup for unmounted components
-3. Cache nested object proxies
-4. Add infinite render loop detection
-
-**Phase 2 (Important):**
-5. Fix props deletion handling
-6. Implement key-based component reconciliation
-7. Add state update batching
-8. Consolidate createState/createProps
-
-**Phase 3 (Nice to Have):**
-9. Add dev mode warnings
-10. Implement error boundaries
-11. Add context API
-12. Add computed values and effects
-
-### Overall Assessment
-
-The codebase demonstrates excellent understanding of reactive patterns and clean code organization. The core reactivity system is well-designed and the component model is intuitive.
-
-However, the memory leak issues are critical and must be addressed before this can be used in any real application. The lack of component cleanup and observer management means memory usage will grow unbounded in any app with dynamic content.
-
-With the suggested fixes, this could become a solid lightweight alternative to larger frameworks for simple applications. The architecture is sound - it just needs proper lifecycle management.
-
-**Recommended Next Steps:**
-1. Add comprehensive tests
-2. Implement component lifecycle
-3. Add dev mode warnings
-4. Create example applications to stress-test
-5. Profile memory usage
-6. Add documentation for lifecycle hooks
-
-The project shows great promise as a learning tool and potentially as a lightweight production library once the critical issues are resolved.
-
----
-
-## Implementation Details (2025-11-03)
-
-### ✅ Critical Issue #1: Component Lifecycle with Cleanup
-
-**Implementation in `src/lib/component.ts`:**
-
-1. Added `dispose?: () => void` and `isActive: boolean` fields to `ComponentInstance` interface
-2. Modified `resetComponentRenderOrder()` to mark all components as inactive at render start
-3. Created `cleanupInactiveComponents()` function to filter and dispose inactive components
-4. Updated `createComponentInstance()` to mark components as active when rendered
-5. Added cleanup call in `mount()` function after each render cycle
-
-**Result:** Components that are removed from the tree are now properly cleaned up, preventing unbounded memory growth.
-
-### ✅ Critical Issue #2: Observer Cleanup
-
-**Status:** Already working correctly in the existing implementation.
-
-The `observer()` function in `src/lib/state.ts` properly implements cleanup via `clearObserverSubscriptions()`, which removes observers from all property listener sets before re-running. The root observer in `mount()` clears and re-subscribes on every render, preventing stale subscriptions.
-
-### ✅ Major Issue #1: Nested Object Proxy Caching
-
-**Implementation in `src/lib/state.ts`:**
-
-1. Added `nestedProxyCache` WeakMap to cache nested object proxies
-2. Updated both `createState()` and `createProps()` proxy get handlers to:
-   - Check cache before creating new proxy for nested objects
-   - Store newly created proxies in cache
-   - Return cached proxies on subsequent accesses
-
-**Result:** Prevents creating multiple proxy wrappers for the same nested object on every property access.
-
-### ✅ Major Issue #2: Props Deletion Handling
-
-**Implementation in `src/lib/state.ts`:**
-
-Updated `updateProps()` function to:
-1. Track both existing and new property keys using Sets
-2. Delete properties that are no longer present in newProps
-3. Notify observers when properties are deleted
-
-**Result:** Props that are removed from components are properly deleted from the underlying target object.
-
-### ✅ Major Issue #3: Infinite Render Loop Detection
-
-**Implementation in `src/lib/component.ts`:**
-
-Added to `mount()` function:
-1. `renderDepth` counter and `MAX_RENDER_DEPTH` constant (100)
-2. Increment counter on each render
-3. Throw descriptive error if limit exceeded
-4. Reset counter on next tick after successful render
-
-**Result:** Prevents stack overflow and browser freeze when state is accidentally modified during render, with helpful error message.
-
-### ✅ Major Issue #4: Key-Based Component Reconciliation
-
-**Implementation in `src/lib/component.ts`:**
-
-Complete overhaul of component identity system:
-
-1. **New data structures:**
-   - Changed from `componentRenderOrder: ComponentInstance[]` to `componentInstances: Map<string, ComponentInstance>`
-   - Added `usedKeysInCurrentRender: Set<string>` to track which keys were rendered
-   - Added `key: string` field to `ComponentInstance` interface
-
-2. **Key generation function `generateComponentKey()`:**
-   - If explicit `key` prop provided: uses `${componentFn.name}:${key}`
-   - Otherwise falls back to: `${componentFn.name}:${position}`
-   - Position is still tracked but only as fallback for components without keys
-
-3. **Updated `createComponentInstance()`:**
-   - Now accepts optional `explicitKey` parameter
-   - Generates unique key for each component
-   - Looks up existing instance by key (not position)
-   - If component function changed for same key, disposes old instance
-   - Properly tracks which keys are active in current render
-
-4. **Updated `renderComponent()`:**
-   - Extracts `key` from props alongside `children`
-   - Passes `key` to `createComponentInstance()`
-
-5. **Updated `cleanupInactiveComponents()`:**
-   - Iterates Map instead of array
-   - Removes inactive components by key
-
-**Benefits:**
-- ✅ List items with keys maintain identity when reordered
-- ✅ Conditional rendering no longer causes wrong component matching
-- ✅ Components with explicit keys are reconciled correctly
-- ✅ Fallback to positional keys maintains backward compatibility
-- ✅ Better debugging with component function names in keys
-
-**Example use case now working correctly:**
-```tsx
-// Todo list - each item maintains its state when filtered/reordered
-{todos.map(todo => (
-  <TodoItem key={todo.id} {...todo} />
-))}
-
-// Conditional rendering - components maintain correct identity
-{showModal && <Modal key="main-modal" />}
-<Content />  // Content doesn't shift to Modal's position
+**Example**:
+```typescript
+h('div', {
+  dataset: { userId: '123', role: 'admin' }
+})
+// Renders: <div data-user-id="123" data-role="admin">
 ```
 
-### Testing
+**Recommendation**: ⚠️ **Not needed currently**
+- Can use attributes module for same purpose
+- Adds complexity without clear benefit
+- Current attribute approach works fine
 
-All changes have been verified:
-- ✅ Dev server starts successfully
-- ✅ TypeScript compilation works
-- ✅ Changes are backward compatible
-- ✅ Todo app example demonstrates component lifecycle with conditional rendering
-- ✅ Todo list uses key prop and maintains component identity during filtering
+---
+
+#### 3. **Advanced Thunk Features** 🚀
+
+**Current Usage**: Using thunks for component isolation ✅
+
+**Additional Capabilities**:
+```typescript
+// Thunk with state arguments for memoization
+thunk('selector', renderFn, stateArg1, stateArg2, ...)
+// Re-renders only if stateArgs change
+```
+
+**Recommendation**: ℹ️ **Already optimal**
+- Current thunk implementation is correct
+- Uses render function as key + cache key
+- State changes trigger observer → re-render
+- No need for manual state arguments
+
+---
+
+#### 4. **Hooks System** 🎣
+
+**Available Hooks**:
+
+**Module-level**: `pre`, `create`, `update`, `destroy`, `remove`, `post`
+
+**Element-level** (via `vnode.data.hook`):
+- `init` - New vnode created
+- `create` - DOM element created
+- `insert` - Element inserted into document ✅ (could use for `onMount`)
+- `prepatch` - Before patch
+- `update` - During patch
+- `postpatch` - After patch
+- `destroy` - Element removed
+- `remove` - Element detached (can delay with callback)
+
+**Current Implementation**: Using `insert` hook via custom `onMount` system ✅
+
+**Recommendation**: ✅ **Current approach is good**
+- Already handling lifecycle correctly
+- Custom `onMount`/`onCleanup` is cleaner API than raw hooks
+- Could potentially optimize by using more hooks internally
+
+**Potential Optimization**:
+```typescript
+// Could use postpatch hook for refs instead of manual post-patch pass
+vnode.data.hook.postpatch = (oldVnode, vnode) => {
+  if (ref && vnode.elm) {
+    setRef(ref, vnode.elm);
+  }
+};
+```
+
+**Implementation Effort**: Medium - Would require refactoring ref system
+
+---
+
+#### 5. **Fragment Support** 📦
+
+**What it does**: Experimental feature for rendering document fragments.
+
+**Example**:
+```typescript
+// Requires init with { experimental: { fragments: true } }
+h('!', null, [child1, child2, child3])
+// Creates DocumentFragment instead of wrapper element
+```
+
+**Recommendation**: ⚠️ **Not needed**
+- Already support fragment syntax: `<>...</>`
+- Current approach uses `h('fragment', ...)` which works fine
+- Experimental feature may be unstable
+- No clear benefit over current approach
+
+---
+
+#### 6. **toVNode - Server-Side Rendering** 🖥️
+
+**What it does**: Convert existing DOM to vnodes for hydration.
+
+**Example**:
+```typescript
+import { toVNode } from 'snabbdom';
+
+const serverRendered = document.getElementById('app')!;
+const vnode = toVNode(serverRendered);
+patch(vnode, h('div', 'Client updated!'));
+```
+
+**Recommendation**: 💡 **Future consideration for SSR**
+- Not needed for current SPA use case
+- Would enable server-side rendering + hydration
+- Significant feature for production frameworks
+
+**Implementation Effort**: High - Requires SSR architecture
+
+---
+
+### Summary & Recommendations
+
+#### Implement Now ⭐
+1. **Style Module Delayed/Destroy Animations**
+   - Low effort, high value for UX
+   - Enhances Suspense transitions
+   - Fits declarative model
+
+#### Consider for Future 💡
+2. **SSR with toVNode** (if/when needed)
+   - High effort, high value for production
+   - Requires architectural changes
+
+#### Already Optimal ✅
+3. **Thunks** - Correctly implemented for component isolation
+4. **Lifecycle Hooks** - Using `insert` hook appropriately via `onMount`
+5. **Core Modules** - All necessary modules in use
+
+#### Not Needed ⚠️
+6. **Dataset Module** - Redundant with attributes
+7. **Fragment Experimental** - Current approach works
+8. **Module-level Hooks** - Component system handles this
+
+---
+
+### Action Items
+
+**High Priority**:
+- [ ] Add TypeScript types for style `delayed` and `destroy` properties
+- [ ] Document delayed animations in CLAUDE.md
+- [ ] Add example of animated Suspense fallback to demo
+
+**Low Priority**:
+- [ ] Consider refactoring ref system to use `postpatch` hook
+- [ ] Investigate SSR requirements if needed in future
+
+---
+
+### Performance Notes
+
+Snabbdom is one of the fastest virtual DOM libraries due to:
+- Minimal core overhead (~200 SLOC)
+- Efficient diffing algorithm
+- Optional thunks for selective re-rendering ✅ (we use this!)
+- Strategic key-based reconciliation
+
+The current implementation takes full advantage of Snabbdom's performance characteristics. The thunk-based component isolation is the primary optimization, and it's correctly implemented.

@@ -1,6 +1,6 @@
 # Superfine Components
 
-A lightweight reactive UI component library built on top of [Superfine](https://github.com/jorgebucaran/superfine), combining virtual DOM rendering with MobX-inspired reactivity.
+A lightweight reactive UI component library built on top of [Snabbdom](https://github.com/snabbdom/snabbdom), combining virtual DOM rendering with MobX-inspired reactivity.
 
 ## What is Superfine Components?
 
@@ -9,7 +9,8 @@ Superfine Components is an experimental framework that demonstrates how to build
 - **React-like component model** - Components are functions that return render functions
 - **Automatic reactivity** - State and props are observable, triggering re-renders when changed
 - **JSX support** - Familiar JSX syntax with TypeScript support
-- **Tiny footprint** - Only depends on Superfine (< 1KB gzipped)
+- **Lightweight footprint** - Only depends on Snabbdom (lightweight virtual DOM library)
+- **Host-based architecture** - Each component manages its own DOM subtree independently
 - **Observable props** - Props automatically trigger child re-renders without explicit memoization
 - **DOM refs** - Direct access to DOM elements via `createRef()` and `ref` attribute
 
@@ -146,21 +147,21 @@ function TodoList() {
 - **Cache Key Format**:
   - With explicit key: `key:${componentFnId}:${key}` (e.g., `key:2:1`)
   - Without key: `pos:${componentFnId}:${position}` (e.g., `pos:2:0`)
-- **Composite Keys**: For Superfine reconciliation, keys include component function ID to prevent collisions (e.g., `2:1` instead of just `1`)
+- **Composite Keys**: For Snabbdom patching, keys include component function ID to prevent collisions (e.g., `2:1` instead of just `1`)
 
 **Benefits:**
 - Component instances persist across parent re-renders
 - State is preserved when list order changes
 - Efficient updates - only changed components re-render
 
-### 5. VNode Caching and Superfine Short-Circuiting
+### 5. VNode Caching and Snabbdom Short-Circuiting
 
 The framework optimizes rendering by caching vnodes at component boundaries:
 
 ```tsx
 // When parent re-renders and child props haven't changed:
 if (instance.dispose && instance.cachedVNode) {
-  // Return cached vnode - Superfine sees oldVNode === newVNode
+  // Return cached vnode - Snabbdom sees oldVNode === newVNode
   // and skips diffing the entire child subtree!
   return instance.cachedVNode;
 }
@@ -173,7 +174,7 @@ if (instance.dispose && instance.cachedVNode) {
 3. **Parent Re-render**: When parent re-renders, it calls `renderComponent()` for each child
 4. **Instance Reuse**: If child instance exists in cache, props are updated (triggers observer if changed)
 5. **Cached Vnode Return**: The **same cached vnode** is returned to parent
-6. **Superfine Optimization**: Superfine checks `if (oldVNode === newVNode)` and skips the subtree!
+6. **Snabbdom Optimization**: Snabbdom checks `if (oldVNode === newVNode)` and skips the subtree!
 7. **Async Observer**: If props/state changed, child's observer runs in microtask and patches its host element directly
 
 **Critical Detail - Cached VNode Stability:**
@@ -181,15 +182,15 @@ if (instance.dispose && instance.cachedVNode) {
 The cached vnode is **never updated** after initial creation. When a component re-renders itself (via its internal observer), it creates a new vnode for patching but does NOT update `instance.cachedVNode`. This stability is essential:
 
 - The parent always receives the **same vnode reference**
-- Superfine's identity check (`oldVNode === newVNode`) works correctly
-- Prevents DOM duplication bugs where Superfine might reuse old DOM nodes from a mutated cached vnode
+- Snabbdom's identity check (`oldVNode === newVNode`) works correctly
+- Prevents DOM duplication bugs where Snabbdom might reuse old DOM nodes from a mutated cached vnode
 
 **Benefits:**
 - Parent re-renders don't trigger synchronous child re-renders
 - Massive performance improvement for large component trees
 - Child components update themselves asynchronously when their props/state change
-- Leverages Superfine's built-in optimization (`oldVNode === newVNode`)
-- Stable vnode references prevent reconciliation bugs
+- Leverages Snabbdom's built-in optimization (`oldVNode === newVNode`)
+- Stable vnode references prevent patching bugs
 
 **Visual Flow:**
 ```
@@ -197,12 +198,12 @@ Parent renders
   ├─> renderComponent(Child1)
   │     ├─> Find cached instance ✓
   │     ├─> Update props (schedules observer in microtask)
-  │     └─> Return cached vnode → Superfine skips Child1 subtree
+  │     └─> Return cached vnode → Snabbdom skips Child1 subtree
   │
   ├─> renderComponent(Child2)
   │     ├─> Find cached instance ✓
   │     ├─> Update props (schedules observer in microtask)
-  │     └─> Return cached vnode → Superfine skips Child2 subtree
+  │     └─> Return cached vnode → Snabbdom skips Child2 subtree
   │
   └─> Parent patch completes
         │
@@ -499,7 +500,7 @@ superfine-components/
 │   │   │   ├── jsx-runtime.ts    # JSX runtime setup
 │   │   │   ├── jsx-dev-runtime.ts # JSX dev runtime
 │   │   │   ├── jsx.d.ts          # JSX type definitions
-│   │   │   ├── superfine.d.ts    # Superfine type augmentation
+│   │   │   ├── snabbdom.d.ts     # Snabbdom type augmentation
 │   │   │   └── index.ts          # Public API exports
 │   │   ├── dist/              # Built output
 │   │   └── package.json
@@ -540,10 +541,10 @@ superfine-components/
 - No need for React.memo or useMemo equivalents
 
 **5. Post-Patch Ref System**
-- Refs applied after Superfine's patch completes
-- Leverages Superfine's `vnode.node` property
+- Refs applied after Snabbdom's patch completes
+- Leverages Snabbdom's `vnode.elm` property
 - Supports both object refs and callback refs
-- No modifications to Superfine required
+- No modifications to Snabbdom required
 
 ### TypeScript Configuration
 
@@ -741,13 +742,13 @@ function MeasureElement() {
 **Strengths:**
 - Fine-grained reactivity (property-level tracking)
 - Only affected components re-render
-- Minimal virtual DOM overhead (Superfine is tiny)
+- Lightweight virtual DOM overhead (Snabbdom is efficient)
 - No unnecessary renders from prop drilling
 
 **Trade-offs:**
 - Proxy overhead for every state/props access
 - No memoization API yet
-- Re-creates JSX on every render (but minimal cost with Superfine)
+- Re-creates JSX on every render (but minimal cost with Snabbdom)
 
 ## Use Cases
 
@@ -816,7 +817,7 @@ This is an experimental project for educational purposes.
 
 ## Further Reading
 
-- [Superfine Documentation](https://github.com/jorgebucaran/superfine)
+- [Snabbdom Documentation](https://github.com/snabbdom/snabbdom)
 - [MobX Documentation](https://mobx.js.org/) - Similar reactivity model
 - [Vue Reactivity](https://vuejs.org/guide/extras/reactivity-in-depth.html) - Proxy-based reactivity
 - See `OBSERVABLE_PROPS_IMPLEMENTATION.md` for deep dive into props system
